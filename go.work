@@ -1,0 +1,11 @@
+go 1.27.1
+
+use (
+	./libs
+	./services/catalog
+	./services/media/
+	./services/order
+	./services/thumbnail-worker
+	./services/wallet/
+	./tools/automigrate
+)
