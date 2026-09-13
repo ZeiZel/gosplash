@@ -1,0 +1,296 @@
+# CI монорепы gosplash.
+#
+# Одиннадцать Go-модулей объединены go.work (см. корень репозитория), плюс
+# отдельный модуль контрактов proto/ (buf). Поэтому почти каждый job здесь
+# матрицированный: "прогнать X по всем модулям" — это буквально то, чем
+# Makefile занимается локально (`for m in $(MODULES)`), просто выполненное
+# параллельно на отдельных раннерах вместо последовательного цикла.
+#
+# Список модулей для матрицы НЕ захардкожен, а вычисляется из go.work в
+# job'е modules (`go work edit -json`) — это тот же источник правды, что и
+# у самого Go: в go.work появился новый модуль → он сам, без правки этого
+# файла, попадёт в матрицу lint/test.
+#
+# "job lint" из спецификации фазы 6 здесь — это несколько job'ов с общим
+# префиксом lint-*, а не один буквальный YAML-job: buf lint/breaking (не
+# матрицируется, один запуск на всё дерево proto/), golangci-lint (матрица
+# по модулям — у каждого модуля свой go.mod и свой набор транзитивных
+# зависимостей, значит и свой кэш) и gofmt/archcheck (тоже одна проверка на
+# весь репозиторий) плохо уживаются как шаги ОДНОГО матрицированного job'а:
+# либо матрица дублирует buf lint N раз впустую, либо им нужен отдельный
+# не матрицированный job. Разбивка на несколько job'ов даёт то же самое
+# покрытие проверками, но параллельно и без лишней работы.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Новый пуш в тот же PR/ветку отменяет уже идущий прогон CI по ней: гонять
+# линт и тесты для коммита, который только что перезаписали, — трата минут
+# раннера, а не полезная проверка.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Минимально необходимые права по умолчанию (GITHUB_TOKEN только на чтение
+# репозитория) — ни один job здесь не пишет в репозиторий, не публикует
+# релизы и не комментирует PR.
+permissions:
+  contents: read
+
+env:
+  # Версия golangci-lint зафиксирована явно, а НЕ "latest": go.work требует
+  # go 1.27.1, а golangci-lint, собранный более старым тулчейном, отказывается
+  # анализировать код с более новой версией в go.mod/go.work (проверено вручную
+  # при подготовке этой конфигурации — версия ниже v2.13.2 из этого требования
+  # не проходит). "latest" в CI означает, что сборка развалится в день выхода
+  # новой версии без единого изменения в этом репозитории — и именно поэтому
+  # `make tools` (для локальной разработки, где такой сюрприз замечают сразу
+  # и чинят на месте) отличается от CI, где сюрприз находит кто-то другой
+  # неделю спустя.
+  GOLANGCI_LINT_VERSION: v2.13.2
+  BUF_VERSION: "1.50.0"
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # Матрица модулей — общий вход для lint-go, test и build.
+  # ───────────────────────────────────────────────────────────────────────
+  modules:
+    name: список модулей (go.work)
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.list.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+      - id: list
+        name: собрать матрицу из go.work
+        run: echo "modules=$(go work edit -json | jq -c '[.Use[].DiskPath]')" >> "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────────
+  # lint — часть 1/3: контракты (proto/). Не матрицируется: proto/ — один
+  # самостоятельный модуль buf, не входящий в go.work.
+  # ───────────────────────────────────────────────────────────────────────
+  lint-proto:
+    name: lint / buf
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # buf breaking ниже сравнивает текущие контракты с веткой main —
+          # для этого нужна ПОЛНАЯ история (и ref origin/main в ней), а не
+          # один последний коммит, который checkout берёт по умолчанию.
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1.50.0
+        with:
+          version: ${{ env.BUF_VERSION }}
+
+      - name: buf lint
+        working-directory: proto
+        run: buf lint
+
+      - name: buf breaking (сравнение с main)
+        working-directory: proto
+        # ВАЖНО (по заданию фазы 6): этот шаг не должен падать на репозитории
+        # без предыдущей истории. Ровно наша ситуация — сейчас в main один
+        # коммит: origin/main и HEAD совпадают, и сравнивать буквально не с
+        # чем. `buf breaking --against` в этом случае либо не найдёт
+        # осмысленной точки сравнения, либо бессмысленно сравнит коммит сам
+        # с собой — в обоих случаях правильный ответ "пропустить", а не упасть.
+        # Проверяем это ДО вызова buf, а не полагаемся на его код возврата:
+        # так разница между "нечего сравнивать" (ожидаемо, зелёным) и
+        # "настоящая breaking-находка" (красным) видна в логе однозначно.
+        run: |
+          if git rev-parse --verify -q origin/main >/dev/null \
+             && [ "$(git rev-parse origin/main)" != "$(git rev-parse HEAD)" ]; then
+            buf breaking --against '../.git#ref=origin/main,subdir=proto'
+          else
+            echo "::notice::buf breaking пропущен — origin/main совпадает с HEAD (нет предыдущего коммита для сравнения)"
+          fi
+
+  # ───────────────────────────────────────────────────────────────────────
+  # lint — часть 2/3: golangci-lint по каждому модулю отдельно. У каждого
+  # сервиса свой go.mod (см. docs/adr/0001-*) и свой набор транзитивных
+  # зависимостей — отдельный прогон на модуль даёт отдельный кэш модулей
+  # Go и параллельность вместо последовательного `for m in $(MODULES)`,
+  # каким лint выглядит в Makefile.
+  # ───────────────────────────────────────────────────────────────────────
+  lint-go:
+    name: lint / golangci-lint (${{ matrix.module }})
+    needs: modules
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.modules.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          # Общий кэш по хэшу ВСЕХ go.sum сразу: у модулей монорепы
+          # частично пересекающиеся зависимости (franz-go, otel, gorm...),
+          # и одиннадцать раздельных кэшей только дублировали бы одни и те
+          # же скачанные модули одиннадцать раз.
+          cache-dependency-path: "**/go.sum"
+
+      - uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: ${{ matrix.module }}
+          # .golangci.yml лежит один раз в корне репозитория, а не в каждом
+          # модуле: golangci-lint сам ищет конфиг вверх по дереву каталогов
+          # от working-directory и находит корневой файл — проверено вручную
+          # запуском из services/media при подготовке конфигурации, отдельно
+          # указывать -c не нужно.
+
+  # ───────────────────────────────────────────────────────────────────────
+  # lint — часть 3/3: то, что не привязано к конкретному Go-модулю —
+  # форматирование всего дерева разом и архитектурные правила (tools/archcheck),
+  # который тоже сканирует репозиторий целиком, а не модуль за модулем.
+  # ───────────────────────────────────────────────────────────────────────
+  lint-misc:
+    name: lint / gofmt + archcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      - name: gofmt -l
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt нашёл неотформатированные файлы:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: archcheck
+        run: go run ./tools/archcheck/cmd/archcheck -root . -v
+
+  # ───────────────────────────────────────────────────────────────────────
+  # test — go test -race по каждому модулю отдельно + покрытие артефактом.
+  # ───────────────────────────────────────────────────────────────────────
+  test:
+    name: test (${{ matrix.module }})
+    needs: modules
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.modules.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      - name: go test -race
+        working-directory: ${{ matrix.module }}
+        # -tags=integration НЕ передаётся: интеграционные тесты (testcontainers-go)
+        # живут в отдельном job'е integration ниже — у них другой профиль
+        # (минуты, а не секунды, и нужен Docker), смешивать с обычным `test`
+        # означало бы, что каждый PR ждёт поднятия Kafka/Postgres/ClickHouse
+        # ради unit-проверки одной функции.
+        run: go test ./... -race -count=1 -covermode=atomic -coverprofile=coverage.out
+
+      - name: имя артефакта из пути модуля
+        id: meta
+        # "." → root, "./services/media" → services-media — иначе
+        # upload-artifact не примет "." как имя, а несколько модулей с
+        # одинаковым базовым именем (например media есть и в services/media)
+        # не должны перезаписать друг друга.
+        run: |
+          name=$(echo "${{ matrix.module }}" | sed 's#^\./##; s#/#-#g; s#^\.$#root#')
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ steps.meta.outputs.name }}
+          path: ${{ matrix.module }}/coverage.out
+          # Если у модуля нет тестов вообще (0 issues в тестах — редкий, но
+          # реальный случай для tools/*), coverage.out может не появиться:
+          # `go test` не пишет профиль, если ни один пакет тесты не запускал.
+          # Это не ошибка CI, поэтому предупреждаем, а не роняем job.
+          if-no-files-found: warn
+
+  # ───────────────────────────────────────────────────────────────────────
+  # integration — тесты с тегом `integration` (testcontainers-go: Postgres,
+  # Kafka, Redis, ClickHouse, Elasticsearch — см. docs/STYLE.md "Тесты").
+  #
+  # РЕШЕНИЕ (по заданию фазы 6, континуирует пункт про continue-on-error
+  # или отдельный workflow): держим их job'ом continue-on-error В ЭТОМ ЖЕ
+  # workflow, а не выносим в отдельный файл. Причины:
+  #   1. Отдельный workflow означал бы отдельную вкладку статуса в PR — на
+  #      учебном репозитории с одним CI-обзором это усложняет, а не
+  #      упрощает картину "весь CI одним взглядом".
+  #   2. continue-on-error делает регрессию ВИДИМОЙ (жёлтый крестик в
+  #      сводке checks), но не блокирующей: контейнерные тесты в GitHub
+  #      Actions (shared, часто перегруженные раннеры) минутами ждут
+  #      скачивание образов Kafka/ClickHouse/Elasticsearch и иногда падают
+  #      по таймауту без вины кода — блокировать мердж из-за инфраструктурной
+  #      флаки было бы хуже, чем изредка пропустить настоящую находку,
+  #      которую в любом случае продолжают ловить unit-тесты (test job) и
+  #      юнит-подделки портов (docs/STYLE.md: "Прикладной слой тестируется
+  #      подделками портов, без контейнеров").
+  #   3. Матрица здесь НЕ выводится из go.work, в отличие от lint-go/test:
+  #      интеграционные тесты есть только в четырёх местах, и это разница
+  #      в самой природе набора (какие модули ИМЕЮТ файлы с тегом
+  #      integration), а не производная от списка модулей workspace — тянуть
+  #      сюда динамику ради четырёх строк было бы лишней косвенностью.
+  #      Список нужно обновить вручную, если integration-тесты появятся
+  #      в новом месте (в CI это заметно по нулевому числу тестов в логе).
+  # ───────────────────────────────────────────────────────────────────────
+  integration:
+    name: integration (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - . # pkg/outbox (relay_integration_test.go), pkg/redisx
+          - services/search # internal/adapters/es
+          - services/analytics # internal/adapters/clickhouse
+          - tools/search-reindex # internal/reindex
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      # Docker Engine на GitHub-раннерах ubuntu-latest уже установлен и
+      # запущен — testcontainers-go подключается к нему через сокет без
+      # какой-либо дополнительной настройки (ровно то допущение, о котором
+      # говорит задание фазы 6: "в GitHub Actions docker доступен").
+      - name: go test -tags=integration
+        working-directory: ${{ matrix.module }}
+        run: go test ./... -tags=integration -count=1 -timeout=15m
+
+  # ───────────────────────────────────────────────────────────────────────
+  # build — все бинарники сервисов и утилит. Переиспользует `make build`
+  # (BINARIES уже перечислены в корневом Makefile) вместо того, чтобы
+  # заново собирать список целей сборки здесь.
+  # ───────────────────────────────────────────────────────────────────────
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      - name: make build
+        run: make build
