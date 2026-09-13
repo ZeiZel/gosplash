@@ -1,58 +1,51 @@
-// Package migrations — схема media-service. Применяется к КАЖДОМУ шарду.
+// Package migrations — схема media-сервиса.
+//
+// Мигрирует ОДИН шард. Вызывающий (tools/automigrate) прогоняет эту функцию
+// по каждому шарду: схема на них обязана быть идентичной, иначе один и тот же
+// код будет работать с одной базой и падать на другой.
+//
+// Почему пакет не в internal/: его импортирует tools/automigrate, который
+// лежит вне services/media, а из internal импортировать снаружи нельзя.
 package migrations
 
 import (
 	"fmt"
-	"time"
 
 	"gorm.io/gorm"
 
-	"photostock/services/media/migrations/models"
+	"gosplash/pkg/idempotency"
+	"gosplash/pkg/outbox"
+	"gosplash/services/media/internal/adapters/pg"
 )
 
+// Migrate приводит схему шарда к текущим моделям.
+//
+// Источник схемы — структуры адаптера PostgreSQL, а не доменные типы: теги
+// gorm живут там, и это правильное место для знания о том, как выглядит
+// таблица (см. комментарий к PhotoRow).
+//
+// AutoMigrate создаёт таблицы, добавляет недостающие колонки и индексы.
+// Чего он НЕ делает: не удаляет колонки, не меняет их тип «сужающе»
+// и не переименовывает. Для учебного проекта этого достаточно; в проде
+// рядом обычно живёт инструмент с версионированными миграциями
+// (goose, migrate), потому что там нужен откат и предсказуемый порядок.
+//
+// outbox.OutboxRow и idempotency.ProcessedEvent — служебные таблицы паттернов
+// (docs/adr/0008-*), а не бизнес-схема media, но живут в той же функции
+// Migrate: вызывающий (tools/automigrate) прогоняет ЭТУ функцию по ОБОИМ
+// шардам, а значит, ровно так же по обоим шардам разъедутся outbox и
+// processed_events — и это то самое следствие шардирования media, о котором
+// говорит docs/adr/0002-*: у каждого шарда своя, независимая копия обеих
+// таблиц, а не одна общая на весь сервис.
 func Migrate(db *gorm.DB) error {
-	// Обычные таблицы — GORM справляется сам.
-	if err := db.AutoMigrate(&models.Image{}, &models.Thumbnail{}); err != nil {
-		return fmt.Errorf("automigrate: %w", err)
+	if err := db.AutoMigrate(&pg.PhotoRow{}); err != nil {
+		return fmt.Errorf("photos: %w", err)
 	}
-
-	// Outbox партиционирован по дню — AutoMigrate такое не умеет, raw SQL.
-	// Ключ партиционирования (created_at) обязан входить в PK.
-	if err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS outbox (
-			id           BIGSERIAL,
-			aggregate_id UUID        NOT NULL,
-			topic        TEXT        NOT NULL,
-			payload      BYTEA       NOT NULL,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-			published_at TIMESTAMPTZ,
-			PRIMARY KEY (id, created_at)
-		) PARTITION BY RANGE (created_at);
-
-		CREATE INDEX IF NOT EXISTS outbox_unpublished_idx
-			ON outbox (created_at) WHERE published_at IS NULL;
-	`).Error; err != nil {
+	if err := outbox.Migrate(db, "media"); err != nil {
 		return fmt.Errorf("outbox: %w", err)
 	}
-
-	// Партиции на сегодня и неделю вперёд. Relay в media-service вызывает
-	// EnsureDailyPartitions ежедневно, чтобы они не кончались.
-	return EnsureDailyPartitions(db, time.Now(), 7)
-}
-
-// EnsureDailyPartitions создаёт партиции outbox от from на days дней вперёд.
-// Идемпотентна: IF NOT EXISTS.
-func EnsureDailyPartitions(db *gorm.DB, from time.Time, days int) error {
-	day := from.UTC().Truncate(24 * time.Hour)
-	for i := 0; i < days; i++ {
-		start, end := day.AddDate(0, 0, i), day.AddDate(0, 0, i+1)
-		q := fmt.Sprintf(
-			`CREATE TABLE IF NOT EXISTS outbox_%s PARTITION OF outbox FOR VALUES FROM ('%s') TO ('%s')`,
-			start.Format("2006_01_02"), start.Format("2006-01-02"), end.Format("2006-01-02"),
-		)
-		if err := db.Exec(q).Error; err != nil {
-			return err
-		}
+	if err := db.AutoMigrate(&idempotency.ProcessedEvent{}); err != nil {
+		return fmt.Errorf("processed_events: %w", err)
 	}
 	return nil
 }
