@@ -149,7 +149,7 @@ gosplash/
 | 0.2 ✅ | Переезд структуры целиком (§3): корневой модуль, `pkg/`, `proto/gosplash/**`, `gen/go`, `deploy/compose`. Правка `go.work`, `buf.*.yaml`, `Makefile`, `.env.example`, `README.md` |
 | 0.3 ✅ | Переименование `Image` → `Photo`, топики → `media.photo.uploaded` и т.д., `kafka-init` переписан. `Envelope` введён и применён сразу (см. ADR 0003). Hexagonal-раскладка в media и catalog |
 | 0.4 ✅ | `pkg/otelx`: OTel SDK (traces + metrics), `slog` JSON с `trace_id`/`span_id`, `otelgorm`. `pkg/httpx`: middleware (recovery, logging, RED-метрики), единый формат ошибки, `/healthz`, `/readyz` (PG ping + Kafka metadata + Redis ping), graceful shutdown 15 с, `pprof` на отдельном порту |
-| 0.5 ✅ | `deploy/compose/observability.yml`: OTel Collector, Tempo, Loki + promtail, Prometheus, Grafana с дашбордом «gosplash overview». Jaeger уходит ([ADR 0005](adr/)) |
+| 0.5 ✅ | `deploy/compose/docker-compose.observability.yml`: OTel Collector, Tempo, Loki + promtail, Prometheus, Grafana с дашбордом «gosplash overview». Jaeger уходит ([ADR 0005](adr/)) |
 | 0.6 ✅ | Первые тесты: unit на `dbx.Shards.Index` (стабильность хэша), на `httpx`, на конфиг. `make test` перестаёт быть пустым |
 
 **Готово, когда:** `make up` поднимает всё включая observability; `make demo-0`

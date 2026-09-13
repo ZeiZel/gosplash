@@ -305,36 +305,77 @@ MODULES := . \
            services/thumbnail-worker services/analytics services/search \
            tools/automigrate tools/mediactl tools/kafka-reprocess
 
-# Что собирать в ./bin — только то, у чего есть main.
-BINARIES := services/media/cmd/media \
-            services/analytics/cmd/analytics \
-            services/search/cmd/search \
-            services/catalog/cmd/catalog \
-            services/wallet/cmd/wallet \
-            services/order/cmd/order \
-            services/order/cmd/worker \
-            services/thumbnail-worker/cmd/thumbnail-worker \
-            tools/automigrate/cmd/automigrate \
-            tools/mediactl/cmd/mediactl \
-            tools/kafka-reprocess/cmd/kafka-reprocess
+# Что собирать в ./build — только то, у чего есть main. Формат элемента —
+# имя-бинарника=путь-к-cmd, а не просто путь: для большинства пар имя и так
+# совпало бы с basename пути, но services/order/cmd/worker — исключение
+# (Temporal worker, а не HTTP/gRPC API) и должен называться order-worker,
+# иначе оба Docker-образа порядка (deploy/docker/order.Dockerfile и
+# order-worker.Dockerfile) не найдут в build/ бинарник с ожидаемым именем.
+BINARIES := media=services/media/cmd/media \
+            analytics=services/analytics/cmd/analytics \
+            search=services/search/cmd/search \
+            catalog=services/catalog/cmd/catalog \
+            wallet=services/wallet/cmd/wallet \
+            order=services/order/cmd/order \
+            order-worker=services/order/cmd/worker \
+            thumbnail-worker=services/thumbnail-worker/cmd/thumbnail-worker \
+            automigrate=tools/automigrate/cmd/automigrate \
+            mediactl=tools/mediactl/cmd/mediactl \
+            kafka-reprocess=tools/kafka-reprocess/cmd/kafka-reprocess
+
+# Кросс-компиляция для образов: GOOS всегда linux (Docker-хост здесь ни при
+# чём — важна ОС ВНУТРИ контейнера), а GOARCH по умолчанию берём с хоста,
+# а не хардкодим amd64. Причина: kind поднимает узлы через сам Docker Desktop
+# на этой машине, и его containerd работает под архитектурой ХОСТА — на
+# Apple Silicon это arm64, и linux/amd64-бинарник там тоже завёлся бы (через
+# эмуляцию Rosetta/qemu), но заметно медленнее и с риском словить редкие баги
+# эмуляции сети/синхронизации, которых на "родной" архитектуре нет. В CI
+# (GitHub Actions ubuntu-latest) `go env GOARCH` вернёт amd64 — тоже верно
+# по умолчанию. Переопределяется явно, когда образ реально нужен под другую
+# архитектуру: make build-linux ARCH=amd64.
+ARCH ?= $(shell go env GOARCH)
 
 .PHONY: tidy
 tidy: ## go mod tidy во всех модулях + go work sync
 	@for m in $(MODULES); do echo "→ $$m"; (cd $$m && go mod tidy) || exit 1; done
 	go work sync
 
-.PHONY: fmt vet build test test-cover lint
+.PHONY: fmt vet build build-linux test test-cover lint
 fmt: ## gofmt всего дерева
 	gofmt -l -w .
 vet: ## go vet по всем модулям
 	@for m in $(MODULES); do (cd $$m && go vet ./...) || exit 1; done
 	@echo "vet: чисто"
-build: ## собрать все бинарники в ./bin
-	@mkdir -p bin
+build: ## собрать все бинарники в ./build (нативно, под ОС/архитектуру хоста — для локального запуска)
+	@mkdir -p build
 	@for b in $(BINARIES); do \
-		name=$$(basename $$b); \
-		go build -o bin/$$name ./$$b || exit 1; \
-		echo "  bin/$$name"; \
+		name=$${b%%=*}; path=$${b#*=}; \
+		go build -o build/$$name ./$$path || exit 1; \
+		echo "  build/$$name"; \
+	done
+
+# ЦЕНТРАЛИЗОВАННАЯ СБОРКА ДЛЯ ДЕПЛОЯ: раньше каждый deploy/docker/*.Dockerfile
+# заново тянул go.mod/go.sum и компилировал свой сервис ВНУТРИ builder-стадии
+# образа — граф зависимостей (grpc, otel, pgx, ...) компилировался девять
+# раз, по разу на образ, даже когда правка касалась одного сервиса. Теперь
+# `go build` выполняется здесь, ОДИН раз на бинарник, и Dockerfile-ы (см.
+# любой из deploy/docker/*.Dockerfile) просто копируют готовый файл из
+# ./build — по сути тот же принцип, что replace вместо go.work в старом
+# builder-приёме: не пересобирать то, что уже собрано рядом.
+#
+# ЦЕНА этого переноса — Dockerfile перестаёт быть самодостаточным: сам по
+# себе `docker build` больше НЕ соберёт образ с нуля, ему нужен файл
+# build/<имя>, которого без предварительного `make build-linux` просто нет
+# на диске. Раньше `git clone && docker build` работал всегда; теперь
+# порядок обязателен: `make build-linux`, потом `docker build`. Это открытый
+# компромисс, а не побочный эффект — см. разбор в отчёте задачи и в
+# deploy/docker/media.Dockerfile.
+build-linux: ## собрать все бинарники под linux/<arch> в ./build (для Docker-образов; ARCH по умолчанию — хостовая, override: make build-linux ARCH=amd64)
+	@mkdir -p build
+	@for b in $(BINARIES); do \
+		name=$${b%%=*}; path=$${b#*=}; \
+		CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -trimpath -ldflags="-s -w" -o build/$$name ./$$path || exit 1; \
+		echo "  build/$$name (linux/$(ARCH))"; \
 	done
 test: ## прогнать тесты во всех модулях
 	@for m in $(MODULES); do (cd $$m && go test ./... -count=1) || exit 1; done
@@ -545,4 +586,4 @@ demo-0: ## фаза 0: проверить, что сервисы отдают м
 
 .PHONY: clean
 clean: ## удалить артефакты сборки
-	rm -rf bin coverage.out
+	rm -rf build coverage.out

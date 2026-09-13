@@ -4,7 +4,7 @@
 # DC и API уже определены в главном Makefile. k6 запускается через
 # `docker run grafana/k6` (см. deploy/k6/README.md) — локальный k6-бинарь
 # не нужен. host.docker.internal — тот же приём, каким NGINX
-# (deploy/compose/gateway.yml) достаёт до media/catalog/wallet/order,
+# (deploy/compose/docker-compose.gateway.yml) достаёт до media/catalog/wallet/order,
 # запущенных на хосте через `go run`, а не в контейнерах; --add-host нужен,
 # чтобы это работало не только на Docker Desktop, но и на Linux.
 #

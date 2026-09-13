@@ -11,7 +11,7 @@
 #   1. кластер (узлы существуют, но пустые);
 #   2. образы (собраны И загружены В УЗЛЫ — до этого шага в кластере
 #      физически нечего деплоить: registry для этих образов не существует,
-#      см. deploy/docker/Dockerfile.* и values.yaml любого чарта, комментарий
+#      см. deploy/docker/*.Dockerfile и values.yaml любого чарта, комментарий
 #      про image.pullPolicy);
 #   3. инфраструктура (Postgres/Kafka/Redis/MinIO/ClickHouse/Elasticsearch/
 #      Temporal) и ожидание её готовности — сервисам НЕЧЕГО ПРОВЕРЯТЬ
@@ -30,7 +30,7 @@ K8S_NAMESPACE := gosplash
 
 # Каждый образ — своя пара (Dockerfile, тег). automigrate не является
 # "сервисом" в смысле services/**, но собирается и грузится в кластер
-# точно так же — см. разбор в deploy/docker/Dockerfile.automigrate.
+# точно так же — см. разбор в deploy/docker/automigrate.Dockerfile.
 K8S_IMAGES := media catalog wallet order order-worker thumbnail-worker analytics search automigrate
 
 # Порядок установки Helm-релизов НЕ важен для corretness (Kubernetes сам
@@ -95,11 +95,19 @@ kind-down: ## снести kind-кластер целиком (все данны
 # ─────────────────────────────────────────────────────────────────────────────
 
 .PHONY: k8s-images
-k8s-images: ## собрать образы сервисов (deploy/docker/Dockerfile.*) и загрузить их в kind
+k8s-images: ## собрать бинарники (make build-linux) и образы сервисов (deploy/docker/*.Dockerfile), загрузить их в kind
 	@printf "\033[1m2/5 Образы сервисов\033[0m\n"
+	@printf "  бинарники (build-linux)...\n"
+	@# Централизованная сборка: один `go build` на все девять образов вместо
+	@# builder-стадии в каждом Dockerfile — см. разбор цены и порядок шагов
+	@# в deploy/docker/media.Dockerfile. ARCH по умолчанию — архитектура
+	@# хоста (см. Makefile): kind-узлы — это контейнеры того же Docker
+	@# Desktop, что собирает образы, поэтому "родная" архитектура здесь и
+	@# есть правильная по умолчанию, без эмуляции.
+	@$(MAKE) --no-print-directory build-linux
 	@for img in $(K8S_IMAGES); do \
 		printf "  собираю gosplash/$$img:dev... "; \
-		docker build -q -f deploy/docker/Dockerfile.$$img -t gosplash/$$img:dev . >/tmp/gosplash-build-$$img.log 2>&1 \
+		docker build -q -f deploy/docker/$$img.Dockerfile -t gosplash/$$img:dev . >/tmp/gosplash-build-$$img.log 2>&1 \
 			&& echo ok \
 			|| { echo FAILED; echo "  лог: /tmp/gosplash-build-$$img.log"; exit 1; }; \
 		printf "  загружаю в kind ($(KIND_CLUSTER))... "; \

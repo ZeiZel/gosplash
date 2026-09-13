@@ -66,7 +66,7 @@ make migrate-catalog     # ONLY=catalog — пересоздаёт публик�
 
 Проблема на стороне СЕТИ или PUBLICATION на primary — проверь `docker
 compose logs pg-catalog` на ошибки WAL sender, и что `wal_level=logical`
-всё ещё выставлен (`deploy/compose/postgres.yml`: `command: postgres -c
+всё ещё выставлен (`deploy/compose/docker-compose.postgres.yml`: `command: postgres -c
 wal_level=logical` — если кто-то поднял `pg-catalog` БЕЗ этого флага,
 публикация физически не может писать нужный объём в WAL).
 

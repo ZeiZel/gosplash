@@ -13,7 +13,7 @@
 Альтернатива — **Change Data Capture**: читать не саму таблицу, а поток
 изменений WAL PostgreSQL (`wal_level=logical`, тот же механизм, которым в
 проекте уже пользуется логическая репликация `catalog` — `pg-catalog` →
-`pg-catalog-replica`, см. `deploy/compose/postgres.yml`). Типовая реализация
+`pg-catalog-replica`, см. `deploy/compose/docker-compose.postgres.yml`). Типовая реализация
 — Debezium (Kafka Connect коннектор) с **Outbox Event Router SMT**
 (single message transform), который читает `INSERT`'ы в `outbox` из WAL и
 публикует их в целевые топики напрямую, вообще без отдельного relay-процесса

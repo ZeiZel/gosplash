@@ -4,7 +4,7 @@
 ## (docs/PLAN.md, docs/adr/0017-elasticsearch-protiv-tsvector.md).
 #
 # Цели этого файла предполагают уже поднятую инфраструктуру (`make up` —
-# среди прочего поднимает elasticsearch, deploy/compose/elasticsearch.yml)
+# среди прочего поднимает elasticsearch, deploy/compose/docker-compose.elasticsearch.yml)
 # и уже запущенный search-сервис. Цели `run-search` в главном Makefile пока
 # нет (заведение — работа интегратора при вливании фазы, см.
 # services/catalog/../mk/catalog.mk с тем же примечанием) — локально сервис
