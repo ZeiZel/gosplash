@@ -1,5 +1,13 @@
 # Сборка
 /bin/
+# `go build ./...` внутри модуля кладёт бинарник рядом с исходниками и
+# называет его по имени директории — так в репозиторий и попадают
+# случайные 30-мегабайтные артефакты.
+/tools/automigrate/automigrate
+/tools/mediactl/mediactl
+/tools/kafka-reprocess/kafka-reprocess
+/tools/search-reindex/search-reindex
+/tools/archcheck/archcheck
 *.exe
 *.test
 *.out
