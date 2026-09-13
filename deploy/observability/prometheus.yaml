@@ -1,0 +1,32 @@
+# Prometheus САМ приходит за метриками на /metrics каждого сервиса.
+#
+# Сервисы в этом проекте запускаются на хосте (`make run-all`), а Prometheus
+# живёт в контейнере, поэтому адрес — host.docker.internal. Когда сервисы
+# переедут в compose (фаза 6), здесь появятся обычные имена контейнеров.
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yaml
+
+scrape_configs:
+  - job_name: gosplash-services
+    static_configs:
+      - targets:
+          - host.docker.internal:8201   # media
+          - host.docker.internal:8202   # catalog
+          - host.docker.internal:8203   # thumbnail-worker (фаза 1)
+          - host.docker.internal:8204   # wallet (фаза 3)
+          - host.docker.internal:8205   # order (фаза 3)
+    relabel_configs:
+      # Из "host.docker.internal:8201" делаем читаемое имя инстанса.
+      - source_labels: [__address__]
+        regex: .*:(\d+)
+        target_label: port
+        replacement: $1
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

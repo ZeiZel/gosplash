@@ -1,0 +1,56 @@
+# Источники данных подкладываются файлом, а не настраиваются мышкой:
+# ручная настройка живёт в volume и исчезает вместе с `make nuke`.
+#
+# Самое ценное здесь — не сами источники, а СВЯЗИ между ними внизу файла:
+# именно они превращают три отдельных инструмента в один.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # Переход «метрика → трейс»: Prometheus хранит exemplar'ы — точки
+      # на графике, к которым приложен trace_id. Клик по такой точке
+      # открывает трейс именно того запроса, который дал этот всплеск.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      # Переход «трейс → логи»: из спана Grafana соберёт запрос в Loki
+      # по trace_id. Работает ровно потому, что pkg/otelx подмешивает
+      # trace_id в каждую строку лога.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        filterByTraceID: true
+      tracesToMetrics:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # Переход «лог → трейс»: Grafana подсветит поле trace_id в строке
+      # лога как ссылку.
+      derivedFields:
+        - name: trace_id
+          matcherRegex: '"trace_id":"(\w+)"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo

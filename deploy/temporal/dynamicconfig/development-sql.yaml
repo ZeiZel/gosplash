@@ -1,0 +1,17 @@
+# Динамическая конфигурация Temporal — настройки, которые сервер перечитывает
+# на лету, без рестарта. Здесь только послабления для локальной разработки.
+
+# Расширенный поиск воркфлоу по атрибутам (WHERE ...) без Elasticsearch.
+# В проде за это отвечает ES; на SQL-хранилище фича помечена «advanced»
+# и включается явно.
+system.enableReadFromES:
+  - value: false
+frontend.enableUpdateWorkflowExecution:
+  - value: true
+
+# Лимиты RPS. По умолчанию сервер бережёт себя, но локально один воркер
+# может выдать всплеск при отладке ретраев — не хочется ловить ResourceExhausted.
+frontend.rps:
+  - value: 1200
+history.persistenceMaxQPS:
+  - value: 3000

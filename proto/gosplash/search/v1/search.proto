@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package gosplash.search.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SearchService — поиск по каталогу в Elasticsearch.
+//
+// Отдельный сервис, а не метод каталога, потому что у поиска другой индекс,
+// другая модель отказа (ES может лежать, а каталог — работать) и другой
+// жизненный цикл: индекс перестраивается целиком, база каталога — нет.
+// ─────────────────────────────────────────────────────────────────────────────
+service SearchService {
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+message SearchRequest {
+  // Свободный текст. Пусто — вернутся все документы, отфильтрованные ниже.
+  string query = 1;
+
+  Filters filters = 2;
+  int32 limit = 3;
+
+  // Keyset-пагинация через search_after. from+size в ES работает только
+  // на первых страницах: чтобы отдать 10 000-ю, узел обязан собрать и
+  // отсортировать все 10 000 с КАЖДОГО шарда. search_after такого не требует.
+  string cursor = 4;
+}
+
+message Filters {
+  // Точное совпадение по тегам: поле keyword, не анализируется.
+  repeated string tags = 1;
+  int32 price_min_cents = 2;
+  int32 price_max_cents = 3;
+  int64 author_id = 4;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  // Сколько всего нашлось. По умолчанию ES считает точно только до 10 000 —
+  // дальше отдаёт нижнюю границу, и это осознанный размен скорости на
+  // точность числа, которое почти никому не нужно.
+  int64 total = 2;
+  string next_cursor = 3;
+
+  // Фасеты: сколько документов под каждым тегом в ТЕКУЩЕЙ выдаче.
+  // Считаются тем же запросом, а не отдельным, — в этом и смысл aggs.
+  repeated Facet tag_facets = 4;
+}
+
+message SearchHit {
+  string listing_id = 1;
+  string title = 2;
+  int64 author_id = 3;
+  string author_name = 4;
+  repeated string tags = 5;
+  int64 price_cents = 6;
+  // Релевантность BM25. Именно её невозможно получить от tsvector в
+  // PostgreSQL без ручной реализации — см. README сервиса.
+  float score = 7;
+}
+
+message Facet {
+  string value = 1;
+  int64 count = 2;
+}

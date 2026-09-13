@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package gosplash.catalog.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CatalogService — витрина и лицензии.
+//
+// Каталог одновременно read-модель (её наполняют события) и владелец
+// лицензий (их выдаёт сага). Разные обязанности в одном сервисе — потому что
+// лицензия неотделима от карточки: «что куплено» и «что показываем» это одна
+// сущность с разных сторон.
+// ─────────────────────────────────────────────────────────────────────────────
+service CatalogService {
+  rpc GetListing(GetListingRequest) returns (GetListingResponse);
+  rpc ListListings(ListListingsRequest) returns (ListListingsResponse);
+
+  // Шаги саги. Оба идемпотентны по order_id.
+  rpc GrantLicense(GrantLicenseRequest) returns (GrantLicenseResponse);
+  rpc RevokeLicense(RevokeLicenseRequest) returns (RevokeLicenseResponse);
+
+  // Server-streaming: сервер шлёт обновления карточки, пока клиент слушает.
+  //
+  // Здесь это оправдано ровно потому, что ответов много и они приходят
+  // в неизвестный момент. Если ответ один — это обычный unary, и делать
+  // из него стрим незачем. Обратная сторона: стрим держит соединение и
+  // горутину на сервере, поэтому у него всегда должен быть выход по ctx.
+  rpc WatchListing(WatchListingRequest) returns (stream WatchListingResponse);
+}
+
+// Listing — денормализованная витрина.
+//
+// В ней намеренно лежат данные ТРЁХ сервисов: фото из media, имя автора,
+// цена. Это и есть смысл CQRS-проекции: GET /listings обслуживается одним
+// запросом к одной базе, без походов в media и wallet. Плата — согласованность
+// в конечном счёте: цена здесь может на секунду отставать от источника.
+message Listing {
+  string id = 1;
+  int64 author_id = 2;
+  string author_name = 3;
+
+  string title = 4;
+  repeated string tags = 5;
+
+  string storage_key = 6;
+  // Ключи превью: small / medium / large.
+  map<string, string> thumbnails = 7;
+
+  int64 price_cents = 8;
+  string currency = 9;
+
+  // draft → published → removed.
+  string status = 10;
+
+  google.protobuf.Timestamp published_at = 11;
+  int32 width = 12;
+  int32 height = 13;
+}
+
+message GetListingRequest {
+  string id = 1;
+}
+
+message GetListingResponse {
+  Listing listing = 1;
+}
+
+message ListListingsRequest {
+  int32 limit = 1;
+  // Keyset-пагинация: курсор указывает на последнюю показанную карточку.
+  // OFFSET не используется принципиально — он заставляет базу отсчитывать
+  // и выбрасывать N строк, и на глубоких страницах это становится дорого.
+  string cursor = 2;
+  repeated string tags = 3;
+}
+
+message ListListingsResponse {
+  repeated Listing listings = 1;
+  // Пусто — страниц больше нет.
+  string next_cursor = 2;
+}
+
+message GrantLicenseRequest {
+  string listing_id = 1;
+  int64 buyer_id = 2;
+  // Он же ключ идемпотентности: повтор вернёт ту же лицензию.
+  string order_id = 3;
+}
+
+message GrantLicenseResponse {
+  string license_id = 1;
+  google.protobuf.Timestamp granted_at = 2;
+}
+
+message RevokeLicenseRequest {
+  string order_id = 1;
+  string reason = 2;
+}
+
+message RevokeLicenseResponse {
+  // false, если отзывать было нечего: лицензию не успели выдать.
+  // Это НЕ ошибка — компенсация обязана быть безопасной при повторе
+  // и при отмене шага, который не выполнился.
+  bool revoked = 1;
+}
+
+message WatchListingRequest {
+  string id = 1;
+}
+
+// Имя по правилу buf: ответ RPC называется <Method>Response, даже когда это
+// поток. Правило кажется formality, но оно избавляет от вопроса «как
+// называется тип ответа» во всех генераторах и всех языках сразу.
+message WatchListingResponse {
+  Listing listing = 1;
+  // Что произошло: "published" | "updated" | "removed".
+  string change = 2;
+  google.protobuf.Timestamp occurred_at = 3;
+}

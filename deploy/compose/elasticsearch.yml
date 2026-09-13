@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ELASTICSEARCH — полнотекстовый поиск (фаза 5).
+#
+# Зачем он, если в PostgreSQL есть tsvector и GIN: полнотекстовый поиск в PG
+# умеет находить документы, но плохо умеет три вещи, без которых поиск
+# на витрине не работает, — ранжирование по релевантности (BM25), фасеты
+# («сколько найденного под каждым тегом») и устойчивость к опечаткам.
+# Подробный разбор — в README сервиса search.
+#
+# single-node и security off — только для локального стенда. В проде security
+# выключать нельзя: в этом режиме кластер принимает любые запросы без
+# аутентификации, а ES по умолчанию слушает не только localhost.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.19.11
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      # Куча JVM. Правило ES: -Xms и -Xmx одинаковые (иначе пауза на
+      # расширение кучи) и не больше половины памяти контейнера —
+      # вторая половина нужна файловому кэшу, из которого и читаются индексы.
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      # Порог, после которого ES переводит индексы в режим «только чтение».
+      # На ноутбуке диск обычно занят, и без этой настройки поиск внезапно
+      # перестаёт индексировать с загадочной ошибкой про read_only_allow_delete.
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    ports:
+      - "59200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  elasticsearch-data:

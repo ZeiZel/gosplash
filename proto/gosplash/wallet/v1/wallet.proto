@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package gosplash.wallet.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WalletService — деньги.
+//
+// Четыре метода — это не CRUD, а фазы одной денежной операции, и разделены
+// они именно так, потому что покупка распределённая:
+//
+//	ReserveFunds  — заморозить сумму. Деньги ещё принадлежат покупателю,
+//	                но потратить их второй раз уже нельзя.
+//	CommitFunds   — подтвердить: списать у покупателя, зачислить автору.
+//	ReleaseFunds  — КОМПЕНСАЦИЯ, а не откат. Снимает резерв отдельной
+//	                операцией, и обе остаются в истории.
+//	GetBalance    — доступно / зарезервировано.
+//
+// Двухфазность нужна потому, что между «списать деньги» и «выдать лицензию»
+// стоит сетевая граница: одно может удаться, другое нет. Резерв даёт время
+// узнать исход, не рискуя деньгами.
+// ─────────────────────────────────────────────────────────────────────────────
+service WalletService {
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc ReserveFunds(ReserveFundsRequest) returns (ReserveFundsResponse);
+  rpc CommitFunds(CommitFundsRequest) returns (CommitFundsResponse);
+  rpc ReleaseFunds(ReleaseFundsRequest) returns (ReleaseFundsResponse);
+}
+
+// Деньги — только целые копейки, никогда float.
+//
+// 0.1 + 0.2 в double не равно 0.3, и на балансе это рано или поздно всплывёт
+// расхождением в копейку, которое невозможно объяснить бухгалтерии. Валюта
+// хранится рядом отдельным полем: сумма без валюты — это не сумма.
+message Money {
+  int64 amount_cents = 1;
+  // ISO 4217: "RUB", "USD".
+  string currency = 2;
+}
+
+message GetBalanceRequest {
+  int64 account_id = 1;
+}
+
+message GetBalanceResponse {
+  int64 account_id = 1;
+  // Сколько можно потратить прямо сейчас.
+  Money available = 2;
+  // Сколько заморожено под незавершённые заказы.
+  Money reserved = 3;
+}
+
+message ReserveFundsRequest {
+  int64 account_id = 1;
+  Money amount = 2;
+
+  // Ключ идемпотентности. Сага ретраит activity при любой сетевой ошибке,
+  // и без ключа один повтор означал бы двойной резерв. Значение —
+  // order_id заказа: оно уникально и известно обеим сторонам.
+  //
+  // Правило для всех методов: повтор с тем же ключом возвращает ТОТ ЖЕ
+  // результат и ничего не меняет.
+  string idempotency_key = 3;
+}
+
+message ReserveFundsResponse {
+  // Идентификатор резерва. Им же оперируют Commit и Release.
+  string reservation_id = 1;
+  Money available_after = 2;
+}
+
+message CommitFundsRequest {
+  string reservation_id = 1;
+  // Кому уходят деньги: счёт автора.
+  int64 payee_account_id = 2;
+  string idempotency_key = 3;
+}
+
+message CommitFundsResponse {
+  // Идентификаторы созданных проводок: одна списывает, вторая зачисляет.
+  // В двойной записи они всегда парные и всегда в одной транзакции.
+  repeated string ledger_entry_ids = 1;
+}
+
+message ReleaseFundsRequest {
+  string reservation_id = 1;
+  // Зачем сняли резерв: попадёт в историю и в разбор инцидентов.
+  string reason = 2;
+  string idempotency_key = 3;
+}
+
+message ReleaseFundsResponse {
+  Money available_after = 1;
+}

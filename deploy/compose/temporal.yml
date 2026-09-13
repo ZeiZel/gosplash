@@ -1,0 +1,95 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Temporal — движок долгоживущих воркфлоу. На нём будет собрана
+# оркестрационная сага покупки лицензии (этап 7 плана).
+#
+# Важно понимать разделение ролей:
+#   temporal-server (этот compose)  — инфраструктура. Хранит историю событий
+#                                     воркфлоу, таймеры, очереди задач.
+#                                     Своей бизнес-логики не содержит.
+#   order-service/cmd/worker (твой  — процесс, который забирает задачи из
+#   Go-код)                           task queue и исполняет workflow/activity.
+#
+# Сервер не знает, что такое «покупка лицензии». Он знает только: есть
+# workflow с таким-то id, он на шаге 3, шаг вернул ошибку, надо повторить
+# через 10 секунд. Вся логика — в твоём воркере.
+#
+# Собственная БД у Temporal обязательна и она НЕ пересекается с базами
+# сервисов: там лежит история воркфлоу, а не заказы.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── БД самого Temporal ───────────────────────────────────────────────────
+  # Отдельный контейнер, порт 55437, чтобы не путать с базами сервисов.
+  # auto-setup сам создаст в ней схемы temporal и temporal_visibility.
+  pg-temporal:
+    image: postgres:18-alpine
+    container_name: pg-temporal
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    ports:
+      - "55437:5432"
+    volumes:
+      - pg-temporal-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Сам сервер ───────────────────────────────────────────────────────────
+  # auto-setup = обычный temporal-server + скрипт, который при первом старте
+  # накатывает схему в PostgreSQL и создаёт namespace. В проде схему катят
+  # отдельно (temporal-admin-tools), здесь это лишний шаг.
+  temporal:
+    image: temporalio/auto-setup:1.29.0
+    container_name: temporal
+    restart: unless-stopped
+    depends_on:
+      pg-temporal:
+        condition: service_healthy
+    ports:
+      - "57233:7233"   # gRPC — сюда подключаются и клиент, и воркер
+    environment:
+      DB: postgres12                  # плагин хранилища (подходит для PG 12+)
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: pg-temporal     # хост БД внутри docker-сети
+      # Namespace проекта. Его же указываешь в client.Dial(client.Options{Namespace: ...}).
+      # default создаётся всегда, свой namespace — способ изолировать окружения.
+      DEFAULT_NAMESPACE: gosplash
+      DEFAULT_NAMESPACE_RETENTION: 72h   # сколько хранить историю завершённых воркфлоу
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ../temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # ── Web UI — http://localhost:58233 ──────────────────────────────────────
+  # Здесь и происходит вся магия отладки саги: видно каждый шаг воркфлоу,
+  # входные и выходные данные activity, сколько раз шаг ретраился и почему
+  # упал. Ради одного этого экрана Temporal и берут вместо самописного
+  # оркестратора.
+  temporal-ui:
+    image: temporalio/ui:2.42.1
+    container_name: temporal-ui
+    restart: unless-stopped
+    depends_on:
+      - temporal
+    ports:
+      - "58233:8080"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:3000
+      TEMPORAL_DEFAULT_NAMESPACE: gosplash
+
+volumes:
+  pg-temporal-data:

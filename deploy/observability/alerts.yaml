@@ -1,0 +1,44 @@
+# Правила алертов из §9 спецификации.
+#
+# Локально они никуда не отправляются — Alertmanager не поднят, — но видны
+# в Prometheus на вкладке Alerts и срабатывают по-настоящему. Это и есть
+# смысл: алерт должен быть написан и проверен до того, как понадобится.
+#
+# `for:` важнее, чем кажется: без него любой всплеск на один скрейп поднимает
+# тревогу. Алерт, который будят зря, перестают читать.
+
+groups:
+  - name: gosplash
+    rules:
+      - alert: HighLatencyP99
+        # histogram_quantile по _bucket — единственный способ получить
+        # перцентиль из гистограммы Prometheus. Среднее здесь бесполезно:
+        # оно не показывает хвост, а страдают пользователи именно в хвосте.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (service, le) (rate(http_server_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 HTTP у {{ $labels.service }} выше 500 мс"
+
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Отставание консьюмера {{ $labels.group }} больше 1000 сообщений"
+
+      - alert: OutboxBacklog
+        # Растущий outbox означает, что relay не справляется или Kafka лежит.
+        # События при этом не теряются — в этом и смысл outbox, — но каталог
+        # отстаёт от реальности, и знать об этом надо заранее.
+        expr: outbox_pending > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "В outbox {{ $labels.service }} накопилось больше 100 событий"

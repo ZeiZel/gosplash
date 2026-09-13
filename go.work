@@ -1,11 +1,22 @@
 go 1.27.1
 
+// go.work объединяет все модули монорепы в одно рабочее пространство:
+// импорт gosplash/pkg/dbx из services/media резолвится в соседнюю директорию,
+// без replace-директив в каждом go.mod. При этом любой сервис остаётся
+// самостоятельным модулем и собирается отдельно (в проде так и будет —
+// в Docker-образ попадёт только он и корневой модуль).
 use (
-	./libs
+	.
+	./services/analytics
 	./services/catalog
-	./services/media/
+	./services/media
 	./services/order
+	./services/search
 	./services/thumbnail-worker
-	./services/wallet/
+	./services/wallet
+	./tools/archcheck
 	./tools/automigrate
+	./tools/kafka-reprocess
+	./tools/mediactl
+	./tools/search-reindex
 )

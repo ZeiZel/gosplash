@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package gosplash.analytics.v1;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AnalyticsService — агрегаты поверх ClickHouse.
+//
+// Наружу отдаются только СВОДКИ, и это принципиально: аналитическая база
+// хороша в «посчитай по миллиарду строк», а не в «отдай одну строку по id».
+// Метод «покажи все просмотры фото» здесь отсутствует намеренно — такой
+// запрос означал бы, что ClickHouse используют как OLTP-хранилище.
+// ─────────────────────────────────────────────────────────────────────────────
+service AnalyticsService {
+  rpc TopPhotos(TopPhotosRequest) returns (TopPhotosResponse);
+  rpc PhotoStats(PhotoStatsRequest) returns (PhotoStatsResponse);
+}
+
+message TopPhotosRequest {
+  // day | week | month
+  string period = 1;
+  int32 limit = 2;
+}
+
+message TopPhotosResponse {
+  repeated PhotoRank photos = 1;
+}
+
+message PhotoRank {
+  string photo_id = 1;
+  int64 author_id = 2;
+  int64 views = 3;
+  int64 purchases = 4;
+}
+
+message PhotoStatsRequest {
+  string photo_id = 1;
+  string period = 2;
+}
+
+message PhotoStatsResponse {
+  string photo_id = 1;
+  int64 views = 2;
+  // Уникальные зрители считаются приблизительно (HyperLogLog): точный
+  // COUNT(DISTINCT) по миллиардам строк стоит на порядки дороже, а разница
+  // в доли процента не меняет ни одного решения, которое принимают по этому
+  // числу.
+  int64 unique_viewers_approx = 3;
+  int64 purchases = 4;
+  int64 revenue_cents = 5;
+}

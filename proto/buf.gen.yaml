@@ -1,0 +1,43 @@
+# Что и куда генерировать из .proto.
+#
+# Директория proto/ — это ИСХОДНИКИ контрактов, Go-кода и go.mod здесь нет.
+# Сгенерированный код кладётся в ../gen/go и принадлежит корневому модулю
+# gosplash, который импортируют все сервисы.
+#
+# Правило зависимостей монорепы: сервисы не импортируют друг друга,
+# только корневой модуль (контракты + инфраструктурная обвязка из pkg/).
+version: v2
+
+# managed mode проставляет go_package за тебя, поэтому в .proto-файлах
+# эту опцию писать не нужно: gosplash/media/v1/media.proto автоматически
+# получит go_package = gosplash/gen/go/gosplash/media/v1.
+#
+# Удвоение «gosplash» в пути неизбежно и осознанно: слева — путь Go-модуля,
+# справа — namespace protobuf-пакета. Подробности в docs/adr/0001-*.
+# В коде это скрыто алиасом импорта: mediav1 "gosplash/gen/go/gosplash/media/v1".
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: gosplash/gen/go
+
+plugins:
+  # Сообщения: структуры Go для message-типов.
+  - local: protoc-gen-go
+    out: ../gen/go
+    opt: paths=source_relative
+
+  # Сервисы: интерфейсы клиента и сервера для gRPC.
+  - local: protoc-gen-go-grpc
+    out: ../gen/go
+    opt: paths=source_relative
+
+  # HTTP/JSON-фасад из аннотаций google.api.http — фаза 3.
+  # Раскомментируй вместе с установкой плагина:
+  #   go install github.com/grpc-ecosystem/grpc-gateway/v2/cmd/protoc-gen-grpc-gateway@latest
+  #
+  # - local: protoc-gen-grpc-gateway
+  #   out: ../gen/go
+  #   opt:
+  #     - paths=source_relative
+  #     - generate_unbound_methods=false

@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NGINX — единственная точка входа снаружи (http://localhost:58080).
+#
+# Почему reverse proxy, а не написанный руками API Gateway на Go: роутинг по
+# префиксу, TLS, лимиты размера тела, балансировка между репликами — это
+# конфиг, а не код. Свой gateway имеет смысл, когда появляется композиция
+# ответов из нескольких сервисов (BFF) или единая аутентификация.
+#
+# Особенность локального запуска: сервисы ты запускаешь через `go run` НА ХОСТЕ,
+# а NGINX живёт в контейнере. Из контейнера хост доступен по имени
+# host.docker.internal (на macOS и Windows работает из коробки; на Linux
+# нужна строка extra_hosts ниже — она добавлена, чтобы конфиг был переносимым).
+#
+# Когда дойдёшь до `docker compose --scale catalog=3`, upstream в gateway.conf
+# нужно будет переключить с host.docker.internal на имя сервиса — Docker DNS
+# сам вернёт адреса всех реплик, и NGINX начнёт балансировать между ними.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  gateway:
+    image: nginx:1.29-alpine
+    container_name: gateway
+    restart: unless-stopped
+    ports:
+      - "58080:8080"
+    volumes:
+      - ../nginx/gateway.conf:/etc/nginx/nginx.conf:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # 127.0.0.1, а не localhost: busybox-wget сначала пробует ::1,
+      # а nginx слушает только IPv4 — получилось бы connection refused.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

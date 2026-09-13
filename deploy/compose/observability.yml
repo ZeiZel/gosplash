@@ -1,0 +1,158 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Наблюдаемость целиком: трейсы, метрики, логи и одно окно, где они сходятся.
+#
+# Зачем это в учебном проекте: в монолите стек-трейс отвечает на вопрос
+# «что происходило в запросе». В распределённой системе такого места нет —
+# запрос идёт NGINX → media → Kafka → worker → Kafka → catalog, и каждый
+# участник видит только свой кусок.
+#
+# Кто за что отвечает:
+#
+#	otel-collector — единственная точка приёма телеметрии от сервисов.
+#	                 Сервис знает один адрес и один протокол (OTLP), а куда
+#	                 это уедет дальше — вопрос конфигурации коллектора,
+#	                 а не пересборки сервиса. Смена Tempo на что угодно
+#	                 другое не трогает ни строчки Go-кода.
+#	tempo          — хранилище трейсов.
+#	prometheus     — метрики. Приходит за ними САМ, на /metrics каждого
+#	                 сервиса (pull). По факту скрейпа сразу видно, жив ли
+#	                 процесс, — при push-модели это пришлось бы проверять
+#	                 отдельно.
+#	loki + promtail— логи. promtail читает stdout контейнеров и docker-логи,
+#	                 Loki индексирует по меткам, а не по содержимому: это
+#	                 делает его дешёвым и заодно объясняет, почему в логах
+#	                 нужны поля (trace_id), а не красивый текст.
+#	grafana        — одно окно. Из графика в трейс, из трейса в логи.
+#
+# Почему не Jaeger, как было раньше: Jaeger умеет только трейсы. Связка
+# Tempo + Loki + Prometheus под одной Grafana даёт переход между тремя
+# сигналами по trace_id — ровно тот сценарий, ради которого всё и строится.
+# См. docs/adr/0005-*.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # OTEL COLLECTOR — приёмник телеметрии.
+  #
+  # Сервисы шлют сюда трейсы по OTLP gRPC на 54317 (с хоста) / 4317 (в сети).
+  # ───────────────────────────────────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.139.0
+    container_name: otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ../observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "54317:4317"   # OTLP gRPC — основной приёмник для Go-сервисов
+      - "54318:4318"   # OTLP HTTP — если удобнее слать по HTTP
+    depends_on:
+      - tempo
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # TEMPO — хранилище трейсов.
+  #
+  # Трейсы не индексируются по содержимому вообще: Tempo умеет искать по
+  # trace_id и по нескольким меткам, и это сознательный размен. Поиск
+  # «покажи все медленные запросы» — работа метрик, а трейс открывают уже
+  # зная, какой именно нужен.
+  # ───────────────────────────────────────────────────────────────────────────
+  tempo:
+    image: grafana/tempo:2.9.1
+    container_name: tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ../observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "53200:3200"   # HTTP API (Grafana ходит сюда)
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # PROMETHEUS — метрики.
+  # ───────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.retention.time=24h
+      # Нужен, чтобы Grafana умела показывать exemplar'ы — точки на графике
+      # со ссылкой на конкретный трейс. Это и есть переход «метрика → трейс».
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ../observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - ../observability/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "59090:9090"   # http://localhost:59090
+    extra_hosts:
+      # Сервисы запускаются на хосте (go run), а Prometheus — в контейнере.
+      # Без этой строки он не найдёт host.docker.internal на Linux.
+      - "host.docker.internal:host-gateway"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # LOKI — логи.
+  # ───────────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.5.7
+    container_name: loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ../observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "53100:3100"
+
+  # promtail собирает stdout контейнеров. Сервисы, запущенные на хосте через
+  # `go run`, сюда не попадают — их логи ты и так видишь в терминале.
+  promtail:
+    image: grafana/promtail:3.5.7
+    container_name: promtail
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail.yaml"]
+    volumes:
+      - ../observability/promtail.yaml:/etc/promtail/promtail.yaml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # GRAFANA — одно окно.
+  #
+  # Источники данных и дашборды подкладываются файлами (provisioning),
+  # а не настраиваются мышкой: настройка мышкой живёт в volume и исчезает
+  # вместе с `make nuke`.
+  # ───────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:12.3.1
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: gosplash
+      GF_SECURITY_ADMIN_PASSWORD: gosplash
+      # Логин не спрашиваем: это локальная песочница, а лишний шаг между
+      # «увидел алерт» и «увидел график» никому не помогает.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "53000:3000"   # http://localhost:53000
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:

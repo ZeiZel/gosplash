@@ -1,0 +1,78 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MinIO — объектное хранилище с S3-совместимым API.
+#
+# Сюда media-service кладёт оригиналы, thumbnail-worker — превью.
+# В PostgreSQL хранятся только метаданные и ключ объекта (storage_key),
+# сами байты в БД не попадают никогда. Это общее правило: реляционная база
+# плохо переносит blob'ы (раздувается WAL, дампы, репликация).
+#
+# API работает по протоколу Amazon S3, поэтому в Go используется обычный
+# aws-sdk-go-v2 или minio-go — код не будет знать, что это не настоящий S3.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    ports:
+      - "59000:9000"   # S3 API — сюда ходит код
+      - "59001:9001"   # веб-консоль — http://localhost:59001 (gosplash/gosplash)
+
+    environment:
+      MINIO_ROOT_USER: gosplash
+      MINIO_ROOT_PASSWORD: gosplash
+      # Адрес, который MinIO подставляет в presigned-ссылки для браузера.
+      # Без него ссылки будут вести на minio:9000 — имя, которое резолвится
+      # только внутри docker-сети, и картинка не откроется с хоста.
+      MINIO_BROWSER_REDIRECT_URL: http://localhost:59001
+
+    command: server /data --console-address ":9001"
+
+    volumes:
+      - minio-data:/data
+
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # MINIO-INIT — разовая настройка: создать бакеты и раздать права.
+  # Тот же принцип, что и kafka-init: инфраструктурная подготовка живёт
+  # в compose, а не в коде сервиса.
+  # ───────────────────────────────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      set -e
+      mc alias set local http://minio:9000 gosplash gosplash
+
+      # originals — приватный бакет. Оригинал в полном разрешении отдаётся
+      # только по presigned-URL и только тому, кто купил лицензию.
+      mc mb --ignore-existing local/gosplash-originals
+
+      # thumbnails — публичный на чтение: превью показываются в ленте всем,
+      # ходить за ними через сервис было бы лишним прыжком.
+      mc mb --ignore-existing local/gosplash-thumbnails
+      mc anonymous set download local/gosplash-thumbnails
+
+      # Оригиналы, которые так и не дошли до обработки (сага упала на полпути),
+      # незачем хранить вечно — удаляем через 7 дней. Заодно это пример
+      # lifecycle-политики, которая в проде экономит основные деньги на S3.
+      mc ilm rule add --expire-days 7 --prefix 'staging/' local/gosplash-originals 2>/dev/null || true
+
+      echo 'Buckets:'
+      mc ls local
+      "
+
+volumes:
+  minio-data:

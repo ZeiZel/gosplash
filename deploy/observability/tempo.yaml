@@ -1,0 +1,31 @@
+# Tempo в режиме «всё в одном процессе, всё на локальном диске».
+# Для продакшена так не делают — там объектное хранилище и разделённые
+# компоненты, — но для одной машины это ровно то, что нужно.
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  # Как долго собирать трейс, прежде чем считать его законченным.
+  # Если сделать слишком коротким, длинные цепочки (media → Kafka →
+  # worker → Kafka → catalog) будут разрываться на части.
+  max_block_duration: 5m
+
+compactor:
+  compaction:
+    block_retention: 24h   # локально история за сутки — более чем достаточно
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal

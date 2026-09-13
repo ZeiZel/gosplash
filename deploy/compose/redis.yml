@@ -1,0 +1,61 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis для Photostock.
+#
+# Один инстанс на весь проект (не по инстансу на сервис — Redis это кэш,
+# потеря данных не страшна, а логическая изоляция делается префиксом ключа:
+#   catalog:image:<id>, catalog:feed:page:<n>, rl:upload:<user_id>).
+#
+# Что на нём будет отрабатываться (этап 3 плана):
+#   cache-aside     — читаем из Redis, при промахе идём в PG и кладём обратно;
+#   refresh-ahead   — фоновая горутина обновляет топ-100 до истечения TTL;
+#   singleflight    — один запрос в БД на N одновременных промахов;
+#   rate limiting   — счётчик загрузок на пользователя (INCR + EXPIRE).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  redis:
+    image: redis:8-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "56379:6379"
+
+    # appendonly yes — writes пишутся в AOF-лог, кэш переживает рестарт.
+    # maxmemory + allkeys-lru — когда упрёмся в 256 МБ, Redis начнёт вытеснять
+    # редко используемые ключи вместо того, чтобы отвечать ошибкой OOM.
+    # Именно так кэш и должен себя вести; для очереди или сессий политика
+    # была бы другой (noeviction).
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+
+    volumes:
+      - redis-data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── RedisInsight — веб-интерфейс (http://localhost:58091) ─────────────────
+  # Чисто для отладки: посмотреть ключи, их TTL, попадания/промахи кэша.
+  # Подключение внутри UI создаётся руками: host `redis`, port 6379.
+  redis-ui:
+    image: redis/redisinsight:latest
+    container_name: redis-ui
+    restart: unless-stopped
+    ports:
+      - "58091:5540"
+    volumes:
+      - redis-ui-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
+  redis-ui-data:

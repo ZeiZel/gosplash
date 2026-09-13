@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL для Photostock.
+#
+# Принцип: одна БД — один сервис (database-per-service). Сервисы не ходят
+# в чужие базы, только через gRPC/Kafka. Иначе сага не нужна — всё можно
+# было бы сделать одной транзакцией, а мы как раз учимся жить без неё.
+#
+#   pg-shard-0, pg-shard-1 — media-service. ДВА ОДИНАКОВЫХ сервера = два шарда.
+#   pg-catalog             — catalog-service, primary
+#   pg-catalog-replica     — catalog-service, read-реплика (логическая репликация)
+#   pg-wallet              — wallet-service (балансы)
+#   pg-order               — order-service (заказы; до перехода на Temporal —
+#                            ещё и таблица состояний саги)
+#
+# Никаких init-скриптов: схему создаёт tools/automigrate (GORM AutoMigrate +
+# raw SQL для партиций). Postgres здесь просто пустой сервер с volume.
+#
+# Шардирование — НЕ фича Postgres. Это два независимых сервера, а решение
+# «в какой писать» принимает Go-код: shard = hash(user_id) % 2.
+# Партиционирование — фича Postgres внутри ОДНОГО сервера, делается в SQL
+# (см. services/catalog/migrations).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# YAML-якорь: общий кусок конфигурации, чтобы не копировать пять раз.
+# Ниже <<: *pg подставляет его в каждый сервис.
+x-pg: &pg
+  image: postgres:18-alpine
+  restart: unless-stopped
+  environment:
+    POSTGRES_USER: gosplash
+    POSTGRES_PASSWORD: gosplash
+    POSTGRES_DB: gosplash       # имя БД одинаковое везде; различаются серверы
+  healthcheck:
+    # pg_isready — проверка «сервер принимает соединения».
+    # Сервисы в общем compose будут ждать condition: service_healthy.
+    test: ["CMD-SHELL", "pg_isready -U gosplash"]
+    interval: 5s
+    timeout: 5s
+    retries: 10
+
+services:
+
+  # ── Шарды media-service ──────────────────────────────────────────────────
+  # Одинаковая схема на обоих (images, thumbnails, outbox).
+  # Данные разные: пользователи с чётным hash — здесь, с нечётным — на shard-1.
+  # Внутри docker-сети адреса pg-shard-0:5432 и pg-shard-1:5432.
+  # С хоста (go run) — localhost:55432 и localhost:55433.
+  pg-shard-0:
+    <<: *pg
+    container_name: pg-shard-0
+    ports:
+      - "55432:5432"
+    volumes:
+      - pg-shard-0-data:/var/lib/postgresql   # данные переживают перезапуск
+
+  pg-shard-1:
+    <<: *pg
+    container_name: pg-shard-1
+    ports:
+      - "55433:5432"      # хост:контейнер — внутри всегда 5432, снаружи разные
+    volumes:
+      - pg-shard-1-data:/var/lib/postgresql
+
+  # ── catalog-service: primary + реплика ───────────────────────────────────
+  # Здесь отрабатывается РЕПЛИКАЦИЯ. Не путать с шардированием выше:
+  #
+  #   шардирование — разные данные на разных серверах, каждая строка ровно
+  #                  на одном; лечит нехватку места и нагрузку на запись;
+  #   репликация   — ОДНИ И ТЕ ЖЕ данные на нескольких серверах; лечит
+  #                  нагрузку на чтение и потерю сервера.
+  #
+  # catalog — read-heavy сервис (лента, карточка, поиск), поэтому реплика
+  # ему нужнее, чем шарды. media — write-heavy и разрезан по пользователям.
+  #
+  # Репликация здесь ЛОГИЧЕСКАЯ: primary объявляет публикацию, реплика
+  # подписывается, и обе команды — обычный SQL, который выполняет
+  # tools/automigrate. Никаких pg_basebackup, init-контейнеров и shell
+  # в compose: реплика поднимается ровно как любой другой пустой Postgres.
+  #
+  # Чем это отличается от физической (streaming) репликации:
+  #   физическая  — побайтовая копия всего кластера, реплика read-only,
+  #                 требует базового бэкапа при старте;
+  #   логическая  — поток изменений отдельных таблиц, реплика остаётся
+  #                 обычной writable-базой, схему на ней надо создать самому,
+  #                 DDL не реплицируется.
+  # Для учебной read-реплики логическая проще и полностью декларативна.
+  pg-catalog:
+    <<: *pg
+    container_name: pg-catalog
+    ports:
+      - "55434:5432"
+    # wal_level=logical нужен ТОЛЬКО издателю: без него Postgres не пишет
+    # в WAL достаточно информации, чтобы восстановить логические изменения,
+    # и CREATE PUBLICATION окажется бесполезным.
+    command: postgres -c wal_level=logical
+    volumes:
+      - pg-catalog-data:/var/lib/postgresql
+
+  # Реплика. Обрати внимание: никакой особой настройки, обычный Postgres.
+  # Вся связь с primary создаётся из миграции командой CREATE SUBSCRIPTION,
+  # и строка подключения в ней указывает на pg-catalog:5432 — адрес ВНУТРИ
+  # docker-сети, потому что выполняет её сервер реплики, а не твой ноутбук.
+  pg-catalog-replica:
+    <<: *pg
+    container_name: pg-catalog-replica
+    ports:
+      - "55438:5432"
+    volumes:
+      - pg-catalog-replica-data:/var/lib/postgresql
+
+  # ── wallet-service ───────────────────────────────────────────────────────
+  # Балансы и история операций. Отдельная БД принципиально: именно потому,
+  # что wallet и order не могут сделать общую транзакцию, нужна сага.
+  pg-wallet:
+    <<: *pg
+    container_name: pg-wallet
+    ports:
+      - "55435:5432"
+    volumes:
+      - pg-wallet-data:/var/lib/postgresql
+
+  # ── order-service ────────────────────────────────────────────────────────
+  # Заказы + saga_instances (состояние ручной саги, этап 6 плана).
+  # После переезда на Temporal saga_instances уходит: Temporal хранит
+  # состояние воркфлоу в СВОЕЙ базе (она в docker-compose.temporal.yml).
+  pg-order:
+    <<: *pg
+    container_name: pg-order
+    ports:
+      - "55436:5432"
+    volumes:
+      - pg-order-data:/var/lib/postgresql
+
+volumes:
+  pg-shard-0-data:
+  pg-shard-1-data:
+  pg-catalog-data:
+  pg-catalog-replica-data:
+  pg-wallet-data:
+  pg-order-data:

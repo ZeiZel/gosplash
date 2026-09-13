@@ -1,0 +1,51 @@
+# Конфигурация OTel Collector.
+#
+# Схема всегда одна и та же: receivers → processors → exporters, собранные
+# в pipeline. Коллектор нужен даже в учебном проекте ровно потому, что он
+# развязывает «куда шлёт сервис» и «где это хранится»: сервис знает один
+# адрес, а маршруты меняются здесь.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Батчинг обязателен: без него каждый спан уезжает отдельным запросом,
+  # и коллектор становится узким местом раньше, чем сервис.
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  # Предохранитель. Коллектор — это процесс с очередью, и при всплеске
+  # трафика он съест всю память и будет убит OOM-киллером ровно тогда,
+  # когда телеметрия нужнее всего. Лучше отбросить часть спанов.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+
+exporters:
+  # Трейсы в Tempo по тому же OTLP.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+  # Отладочный вывод в лог коллектора. Включён с basic-детализацией:
+  # когда трейсы «не доезжают», первый вопрос — доехали ли они сюда.
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo, debug]
+  telemetry:
+    logs:
+      level: info
