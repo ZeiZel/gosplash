@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "thumbnail-worker.fullname" . }}
+  labels:
+    {{- include "thumbnail-worker.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "thumbnail-worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "thumbnail-worker.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Контрольная сумма ConfigMap в аннотации ПОДА.
+        #
+        # Без неё `helm upgrade`, изменивший только ConfigMap, не трогает
+        # шаблон пода — и Kubernetes не видит причины перекатывать
+        # Deployment. Поды продолжают работать со старой конфигурацией,
+        # команда завершается успехом, а `kubectl get cm` показывает новое
+        # значение: расхождение, которое выглядит как «изменение не
+        # применилось по непонятной причине».
+        #
+        # Поймано ровно так: у media в ConfigMap не было KAFKA_BROKERS,
+        # правка чарта прошла успешно, ConfigMap обновился — а поды
+        # остались прежние, с прежним именем, и relay продолжал биться
+        # в localhost.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.scrape }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.metrics | quote }}
+        prometheus.io/path: {{ .Values.metrics.path }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "thumbnail-worker.serviceAccountName" . }}
+      # enableServiceLinks: false — иначе kubelet добавляет в ПОД
+      # переменные вида <ИМЯ_СЕРВИСА>_PORT для каждого Service в
+      # namespace (легаси Docker-links, см. разбор в
+      # deploy/kind/infra/temporal.yaml, где эта переменная реально
+      # сломала temporal-ui). У сервисов gosplash сегодня нет
+      # переменной с таким именем среди ключей pkg/config, но правило
+      # проекта "os.Getenv только в pkg/config" не защищает от того,
+      # что сам под увидит лишнюю переменную из окружения — отключаем
+      # инъекцию целиком, а не полагаемся на отсутствие коллизии сегодня.
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Разбор числа — в values.yaml (terminationGracePeriodSeconds): у
+      # этого сервиса он БОЛЬШЕ, чем у media/catalog, потому что три
+      # шага драйна (consumer/retry-consumer/outbox-relay) в cmd/thumbnail-
+      # worker/main.go ждутся ПОСЛЕДОВАТЕЛЬНО тремя независимыми таймаутами
+      # по 15с (см. функцию waitFor там), а не одним общим бюджетом, как
+      # в catalog/analytics (waitAll с ОБЩИМ deadline).
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: thumbnail-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "thumbnail-worker.fullname" . }}-config
+            - secretRef:
+                name: {{ include "thumbnail-worker.fullname" . }}-secret
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          # НЕТ lifecycle.preStop, в отличие от media/catalog/wallet/order/
+          # analytics/search. preStop там нужен, чтобы пережить задержку
+          # распространения удаления пода из EndpointSlice ПЕРЕД тем, как
+          # SIGTERM оборвёт входящие соединения (см. values.yaml любого из
+          # тех чартов, раздел preStop). У thumbnail-worker Kubernetes
+          # Service вообще не существует (см. отсутствие service*.yaml в
+          # этом чарте) — работу этому поду раздаёт Kafka-ребалансировка
+          # партиций консьюмер-группы, а не kube-proxy/iptables, поэтому
+          # самой проблемы, которую решает preStop, здесь нет: задерживать
+          # SIGTERM было бы паузой без причины.
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

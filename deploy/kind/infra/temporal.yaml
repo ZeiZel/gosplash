@@ -1,0 +1,255 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Temporal для kind — зеркалирует deploy/compose/temporal.yml (pg-temporal +
+# temporalio/auto-setup + temporal-ui). Не в списке, явно перечисленном
+# в задании, но БЕЗ него order и order-worker не смогут даже стартовать:
+# sdkclient.Dial в обоих cmd/order/main.go и cmd/worker/main.go — фатальная
+# ошибка (os.Exit(1)) при недоступном Temporal, в отличие от, скажем,
+# otel-коллектора, который сервисы переживают молча (см. pkg/otelx). Это
+# не "readyz покраснеет", а прямой CrashLoopBackOff обоих Deployment'ов
+# order-service — то есть Temporal здесь настолько же обязателен, насколько
+# Postgres/Kafka/Redis/MinIO, даже хотя формулировка задания его не назвала.
+#
+# ConfigMap temporal-dynamicconfig создаётся ОТДЕЛЬНО, командой в
+# mk/k8s.mk (`kubectl create configmap ... --from-file=deploy/temporal/
+# dynamicconfig/development-sql.yaml`), а не статическим YAML здесь — так
+# сам файл (deploy/temporal/**, вне зоны ограничений задания, но и не
+# созданный этой задачей) остаётся единственным источником правды, и его
+# содержимое не дублируется руками в двух местах, которые могут разъехаться.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-temporal-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-temporal
+  namespace: gosplash
+  labels:
+    app: pg-temporal
+spec:
+  replicas: 1
+  # strategy: Recreate — ОБЯЗАТЕЛЬНО при ReadWriteOnce PersistentVolumeClaim
+  # (том ниже). RollingUpdate (умолчание Deployment) на несколько секунд
+  # держит ДВА пода одновременно — старый ещё не убит, новый уже создан.
+  # С RWO-томом это не split-brain, а жёсткий Pending: том монтируется
+  # РОВНО в один под одновременно, и kubelet нового пода не сможет
+  # примонтировать том, уже занятый старым, — RollingUpdate виснет
+  # навсегда без ручного вмешательства. Recreate прямо говорит Kubernetes:
+  # сначала убей старый под и дождись, пока он освободит том, потом
+  # создавай новый. temporal и temporal-ui ниже состояния не хранят
+  # (читают его из pg-temporal) и Recreate им не нужен по этой же причине —
+  # у них и так осталось умолчание Deployment.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-temporal
+  template:
+    metadata:
+      labels:
+        app: pg-temporal
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      # fsGroup — развёрнутый комментарий в deploy/kind/infra/postgres.yaml
+      # (перед ConfigMap postgres-env). Выставлен единообразно со всеми
+      # остальными подами с PVC.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          env:
+            - name: POSTGRES_USER
+              value: "temporal"
+            - name: POSTGRES_PASSWORD
+              value: "temporal"
+            - name: POSTGRES_DB
+              value: "temporal"
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "temporal"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-temporal-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-temporal
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-temporal
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal
+  namespace: gosplash
+  labels:
+    app: temporal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: temporal
+  template:
+    metadata:
+      labels:
+        app: temporal
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: temporal
+          image: temporalio/auto-setup:1.29.0
+          env:
+            # BIND_ON_IP=0.0.0.0 — слушать ВСЕ интерфейсы пода.
+            #
+            # По умолчанию Temporal привязывается к IP пода (в логе видно
+            # адрес вида 10.244.x.y:7234), и тогда на 127.0.0.1 никто не
+            # отвечает. Для readiness-пробы это смертельно: проба выполняется
+            # ВНУТРИ пода и обязана обращаться к локальному адресу — снаружи
+            # она зависела бы от Service, который маршрутизирует только на
+            # готовые поды, то есть от собственного результата.
+            - name: BIND_ON_IP
+              value: "0.0.0.0"
+            - name: DB
+              value: "postgres12"
+            - name: DB_PORT
+              value: "5432"
+            - name: POSTGRES_USER
+              value: "temporal"
+            - name: POSTGRES_PWD
+              value: "temporal"
+            - name: POSTGRES_SEEDS
+              value: "pg-temporal"
+            - name: DEFAULT_NAMESPACE
+              value: "gosplash"
+            - name: DEFAULT_NAMESPACE_RETENTION
+              value: "72h"
+            - name: DYNAMIC_CONFIG_FILE_PATH
+              value: "config/dynamicconfig/development-sql.yaml"
+          ports:
+            - containerPort: 7233
+          volumeMounts:
+            - name: dynamicconfig
+              mountPath: /etc/temporal/config/dynamicconfig
+              readOnly: true
+          # Проба стучится в 127.0.0.1, а НЕ в Service temporal:7233.
+          #
+          # Это не придирка к стилю, а исправление взаимоблокировки: Service
+          # маршрутизирует трафик только на ГОТОВЫЕ поды, а готовность пода
+          # определяет как раз эта проба. Обращаясь к Service, под ждёт
+          # собственной готовности через механизм, который до этой готовности
+          # не работает, — и остаётся 0/1 навсегда, с сообщением
+          # «connection refused» на адрес ClusterIP.
+          #
+          # Правило общее: проба всегда идёт в локальный порт контейнера.
+          # Снаружи пода она не должна зависеть ни от чего.
+          readinessProbe:
+            exec:
+              command: ["temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 10
+          livenessProbe:
+            tcpSocket:
+              port: 7233
+            initialDelaySeconds: 45
+            periodSeconds: 15
+      volumes:
+        - name: dynamicconfig
+          configMap:
+            # Заводится mk/k8s.mk (см. цель infra-up) из существующего
+            # deploy/temporal/dynamicconfig/development-sql.yaml.
+            name: temporal-dynamicconfig
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal
+  namespace: gosplash
+spec:
+  selector:
+    app: temporal
+  ports:
+    - port: 7233
+      targetPort: 7233
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-ui
+  namespace: gosplash
+  labels:
+    app: temporal-ui
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: temporal-ui
+  template:
+    metadata:
+      labels:
+        app: temporal-ui
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: temporal-ui
+          image: temporalio/ui:2.42.1
+          env:
+            - name: TEMPORAL_ADDRESS
+              value: "temporal:7233"
+            - name: TEMPORAL_DEFAULT_NAMESPACE
+              value: "gosplash"
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-ui
+  namespace: gosplash
+spec:
+  selector:
+    app: temporal-ui
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "order-worker.fullname" . }}
+  labels:
+    {{- include "order-worker.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "order-worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "order-worker.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Контрольная сумма ConfigMap: без неё helm upgrade, изменивший
+        # только конфигурацию, не перекатывает поды — они продолжают
+        # работать со старой. Подробный разбор — в том же месте чарта
+        # media, где этот дефект и был пойман.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      # НЕОЧЕВИДНОЕ РЕШЕНИЕ: аннотаций prometheus.io/* здесь НЕТ, хотя
+      # у остальных семи чартов они есть. cmd/worker (см. package doc
+      # services/order/cmd/worker/main.go) НЕ поднимает httpx.
+      # ServeMetricsAndPprof вообще — ни /metrics, ни /debug/pprof, ни
+      # /healthz. Это единственный процесс в проекте без встроенной
+      # observability-поверхности: наблюдаемость идёт только через трейсы
+      # (otelx) и через сам Temporal (Web UI показывает застрявшие
+      # воркфлоу, retry-счётчики activity и task-queue backlog БЕЗ участия
+      # Prometheus). Добавить сюда аннотацию scrape означало бы солгать
+      # Prometheus'у про порт, которого не существует.
+    spec:
+      serviceAccountName: {{ include "order-worker.serviceAccountName" . }}
+      # enableServiceLinks: false — иначе kubelet добавляет в ПОД
+      # переменные вида <ИМЯ_СЕРВИСА>_PORT для каждого Service в
+      # namespace (легаси Docker-links, см. разбор в
+      # deploy/kind/infra/temporal.yaml, где эта переменная реально
+      # сломала temporal-ui). У сервисов gosplash сегодня нет
+      # переменной с таким именем среди ключей pkg/config, но правило
+      # проекта "os.Getenv только в pkg/config" не защищает от того,
+      # что сам под увидит лишнюю переменную из окружения — отключаем
+      # инъекцию целиком, а не полагаемся на отсутствие коллизии сегодня.
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # ── НЕОЧЕВИДНОЕ РЕШЕНИЕ: liveness/readinessProbe здесь НЕТ ──────────
+      #
+      # Пробы Kubernetes умеют говорить только по HTTP, TCP, gRPC (нативно,
+      # с 1.24) или exec — а у cmd/worker нет НИ ОДНОГО открытого порта:
+      # это чистый Temporal-воркер, который САМ инициирует соединение
+      # к Temporal Frontend и забирает задачи, ничего не слушая (см.
+      # package doc services/order/cmd/worker/main.go). exec-проба тоже
+      # не вариант: итоговый образ — distroless/static (см.
+      # deploy/docker/Dockerfile.order-worker), внутри нет ни шелла, ни
+      # pgrep/ps, чем можно было бы проверить "процесс жив изнутри".
+      #
+      # ЧЕМ ЭТО КОМПЕНСИРУЕТСЯ: Kubernetes и без явной liveness-пробы
+      # перезапускает контейнер при ненулевом коде выхода (restartPolicy
+      # по умолчанию у Deployment — Always) — то есть настоящий краш
+      # процесса и так виден и лечится. Единственное, что НЕ ловится без
+      # HTTP-эндпоинта, — "процесс жив, но завис" (например, deadlock в
+      # обработке activity): для него нет способа отличить "воркер
+      # обрабатывает долгую активность" от "воркер завис" снаружи процесса.
+      # Это ПРИНЯТЫЙ ПРОБЕЛ, а не забытая настройка: закрыть его правильно
+      # можно только добавив httpx.Health в сам cmd/worker (см. package doc
+      # main.go: "это API самого Temporal SDK, а не этого проекта") — то
+      # есть правкой services/order/**, что вне зоны ответственности этой
+      # задачи (deploy/helm/**). См. docs/runbooks/kubernetes.md, раздел
+      # про "неотвечающий воркер саги" — там описано, как ловить это
+      # состояние через Temporal Web UI/tctl, а не через k8s-пробы.
+      #
+      # terminationGracePeriodSeconds ниже НАМЕРЕННО выше, чем у остальных
+      # сервисов: SDK Temporal-воркера (sdkworker.Run с InterruptCh) сам
+      # решает, сколько ждать завершения текущих activity при остановке,
+      # и это решение принимается ВНУТРИ SDK, а не в коде этого проекта —
+      # мы не знаем точного бюджета, поэтому берём консервативную оценку
+      # с запасом, а не оптимистичные цифры, как у httpx-сервисов, где
+      # каждый таймаут виден в pkg/httpx/pkg/grpcx и посчитан явно.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: order-worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "order-worker.fullname" . }}-config
+            - secretRef:
+                name: {{ include "order-worker.fullname" . }}-secret
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

@@ -1,0 +1,118 @@
+# ClickHouse для kind — зеркалирует deploy/compose/clickhouse.yml. Не входит
+# в список, явно перечисленный в задании (Postgres/Kafka/Redis/MinIO), но
+# без него analytics-service никогда не станет ready (health.Register
+# "clickhouse", см. cmd/analytics/main.go) — деплоить сервис без его
+# единственной базы означало бы оставить чарт analytics "теоретически
+# рабочим", но фактически вечно красным на readyz. Простой манифест,
+# без Altinity-оператора — один узел без шардирования/репликации ClickHouse
+# не нуждается ни в чём из того, что даёт оператор.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: clickhouse-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clickhouse
+  namespace: gosplash
+  labels:
+    app: clickhouse
+spec:
+  replicas: 1
+  # strategy: Recreate — ОБЯЗАТЕЛЬНО при ReadWriteOnce PersistentVolumeClaim
+  # (том ниже). RollingUpdate (умолчание Deployment) на несколько секунд
+  # держит ДВА пода одновременно — старый ещё не убит, новый уже создан.
+  # С RWO-томом это не split-brain, а жёсткий Pending: том монтируется
+  # РОВНО в один под одновременно, и kubelet нового пода не сможет
+  # примонтировать том, уже занятый старым, — RollingUpdate виснет
+  # навсегда без ручного вмешательства. Recreate прямо говорит Kubernetes:
+  # сначала убей старый под и дождись, пока он освободит том, потом
+  # создавай новый.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      # fsGroup — развёрнутый комментарий в deploy/kind/infra/postgres.yaml
+      # (перед ConfigMap postgres-env). Официальный образ ClickHouse сам
+      # chown'ит каталог данных в entrypoint'е (аналогично postgres), так
+      # что fsGroup здесь, скорее всего, факультативен, но выставлен
+      # одинаково со всеми остальными подами с PVC, а не точечно.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:25.8
+          env:
+            - name: CLICKHOUSE_USER
+              value: "gosplash"
+            - name: CLICKHOUSE_PASSWORD
+              value: "gosplash"
+            - name: CLICKHOUSE_DB
+              value: "gosplash"
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          ports:
+            - containerPort: 8123
+            - containerPort: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: 8123
+            initialDelaySeconds: 20
+            periodSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: clickhouse-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: gosplash
+spec:
+  selector:
+    app: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: 8123
+    - name: native
+      port: 9000
+      targetPort: 9000

@@ -1,0 +1,23 @@
+# Обычный ClusterIP для HTTP-порта catalog. Почему обычного Service здесь
+# достаточно (в отличие от gRPC-порта ниже, в service-grpc-headless.yaml):
+# HTTP/1.1-клиенты этого порта (браузер через Ingress/NGINX, curl) не держат
+# одно соединение вечно так, как gRPC-клиент на HTTP/2 — каждое новое
+# соединение (или после keep-alive idle timeout) заново проходит через
+# kube-proxy и может попасть в другую реплику. Балансировка на уровне TCP-
+# соединения для такого трафика — это ожидаемое и достаточное поведение,
+# то же решение, что и в фазе 0 для media/catalog в docker-compose (см.
+# docs/adr/0015, раздел "Что это НЕ означает").
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "catalog.fullname" . }}
+  labels:
+    {{- include "catalog.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.http.type }}
+  selector:
+    {{- include "catalog.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http

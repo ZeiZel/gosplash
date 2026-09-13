@@ -1,0 +1,580 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL для kind — 6 независимых серверов, зеркалирующих
+# deploy/compose/postgres.yml (те же имена, тот же образ, те же
+# gosplash/gosplash учебные креды — см. итоговый список "что менять для
+# прода" в deploy/helm/media/values.yaml).
+#
+# ── ПРОСТЫЕ МАНИФЕСТЫ, А НЕ BITNAMI/CNPG-ОПЕРАТОР ────────────────────────────
+# Bitnami postgresql chart (или, тем более, CloudNativePG-оператор) умеет
+# репликацию, метрики, бэкапы и HA из коробки — ровно то, что не нужно
+# ОДНОРАЗОВОМУ кластеру, который живёт от `make kind-up` до `make kind-down`.
+# Цена бы была: (а) чарт тянет 3-5 дополнительных образов (exporter,
+# init-контейнеры) через сеть при каждом `kind-up` с нуля; (б) десятки
+# незнакомых values, из которых для этой задачи нужно два-три; (в) логическая
+# репликация catalog (primary → replica, см. ниже) СДЕЛАНА ВРУЧНУЮ через
+# tools/automigrate — тем же способом, что и в docker-compose, — и bitnami-
+# чарт с его СОБСТВЕННОЙ моделью репликации (streaming, через Patroni/repmgr)
+# только мешал бы, а не помогал: пришлось бы её выключать, чтобы не
+# сталкивалась с логической. Простой Deployment+Service — то же самое,
+# что уже проверено в docker-compose, перенесённое в Kubernetes минимальными
+# средствами.
+#
+# ── PersistentVolumeClaim, а не emptyDir (ИСПРАВЛЕНО после разбора инцидента) ──
+# Раньше здесь было написано, что PVC имел бы смысл, только если данные
+# должны пережить `kind delete cluster`. Это была подмена вопроса: НИКТО
+# не ждёт, что учебная база переживёт снос кластера. Ждут другого — что
+# она переживёт события, которые в ЖИВОМ кластере происходят рутинно и не
+# требуют участия человека: вытеснение пода планировщиком, `kubectl drain`
+# узла, OOM-kill, rolling-обновление образа, обычный `kubectl delete pod`
+# (например, руками во время разбора инцидента). emptyDir живёт РОВНО
+# столько же, сколько живёт конкретный под, а не узел и не кластер — то
+# есть удаление пода стирало не строки, а ВСЮ СХЕМУ (см. воспроизведение
+# инцидента в отчёте по этой задаче), и попутно рвало логическую
+# репликацию pg-catalog → pg-catalog-replica (публикация на primary
+# создаётся заново с пустого состояния, а подписка на реплике продолжает
+# ссылаться на несуществующий слот). Учебный стенд, который своим
+# устройством учит, что "PostgreSQL в Kubernetes можно держать в emptyDir",
+# учит неправильно — это и есть цена старого решения.
+#
+# Граница теперь проведена в другом месте, и это ОСОЗНАННЫЙ выбор, а не
+# компромисс по лени:
+#   - переживает перезапуск ПОДА в живом кластере (drain, OOM, rolling
+#     update, `kubectl delete pod`, краш процесса) — данные лежат в
+#     PersistentVolumeClaim на StorageClass `standard` (local-path-
+#     provisioner, идёт в kind из коробки): PV — это каталог на диске
+#     УЗЛА, а не в самом поде, и переживает пересоздание пода на том же
+#     узле;
+#   - НЕ переживает `kind delete cluster` (и не должно) — local-path
+#     складывает данные PV под /var/local-path-provisioner ВНУТРИ
+#     containerd-хранилища узла (см. deploy/kind/cluster.yaml), которое
+#     `kind delete cluster` удаляет вместе с самими узлами. Это ровно та
+#     же семантика, что и раньше для "стенд воспроизводим с нуля", но
+#     теперь она относится к границе кластера, а не к границе пода —
+#     именно ту границу и ожидает любой, кто работает с Kubernetes не
+#     первый день.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── fsGroup: 1000 на каждом поде с PVC (Postgres тут показан для примера,
+# то же самое стоит в kafka.yaml/minio.yaml/clickhouse.yaml/
+# elasticsearch.yaml/temporal.yaml — см. там короткую отсылку сюда; redis
+# из этого списка исключён — см. развёрнутое объяснение в redis.yaml, у
+# него сознательно нет ни PVC, ни тома вообще) ──────────────────────────────
+# local-path-provisioner создаёт каталог тома на диске узла с владельцем
+# root:root и правами 0700. Процесс postgres в этом образе стартует ОТ ROOT
+# и сам chown'ит PGDATA на пользователя postgres в docker-entrypoint.sh —
+# то есть для ЭТОГО конкретного образа fsGroup не обязателен. Но у
+# apache/kafka, MinIO и elasticsearch (см. соответствующие файлы) контейнер
+# запускается СРАЗУ от непривилегированного пользователя, без такого шага
+# привилегированной инициализации, — там без fsGroup первая же попытка
+# записи в точку монтирования падает с permission denied ("проверено на
+# этой машине" — вживую, при первом переводе elasticsearch на PVC).
+# fsGroup выставлен ОДИНАКОВО на все поды с данными, а не точечно только
+# там, где он строго нужен: он не мешает контейнерам, которые и так
+# бегут от root (kubelet лишь добавляет GID тома в supplementary groups
+# процесса — root это ни разу не ограничивает), а разбираться заново для
+# каждого образа, нужен ли ему fsGroup, дороже, чем поставить его везде.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-env
+  namespace: gosplash
+data:
+  POSTGRES_USER: "gosplash"
+  POSTGRES_PASSWORD: "gosplash"
+  POSTGRES_DB: "gosplash"
+
+---
+# pg-shard-0 / pg-shard-1 — media-service, ДВА ОДИНАКОВЫХ сервера-шарда
+# (см. docs/adr/0002). pg-catalog(+replica) — catalog-service, логическая
+# репликация (настраивается tools/automigrate, см. deploy/kind/jobs/migrate.yaml).
+# pg-wallet / pg-order — по одной базе на сервис, без шардов и реплик.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-shard-0-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-shard-0
+  namespace: gosplash
+  labels:
+    app: pg-shard-0
+spec:
+  replicas: 1
+  # strategy: Recreate — ОБЯЗАТЕЛЬНО при ReadWriteOnce PersistentVolumeClaim
+  # (том ниже). RollingUpdate (умолчание Deployment) на несколько секунд
+  # держит ДВА пода одновременно — старый ещё не убит, новый уже создан.
+  # С emptyDir это было бы split-brain (два процесса с двумя независимыми
+  # копиями данных под одним Service); с RWO PVC это не split-brain, а
+  # жёсткий Pending: ReadWriteOnce означает "том монтируется РОВНО в один
+  # под одновременно", и kubelet нового пода физически не может
+  # примонтировать том, уже занятый старым, — RollingUpdate виснет
+  # навсегда в ожидании, которое без ручного вмешательства не наступит.
+  # Recreate прямо говорит Kubernetes: сначала убей старый под и дождись,
+  # пока он освободит том, потом создавай новый — гонки за монтированием
+  # не возникает вообще.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-shard-0
+  template:
+    metadata:
+      labels:
+        app: pg-shard-0
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      # fsGroup — см. развёрнутый комментарий в начале файла, перед
+      # ConfigMap postgres-env. Для этого конкретного образа не обязателен
+      # (entrypoint сам chown'ит PGDATA от root), но выставлен одинаково
+      # на всех подах с PVC, а не точечно.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          envFrom:
+            - configMapRef:
+                name: postgres-env
+          # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
+          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # просто лишняя запись в WAL без потребителя, поэтому параметр
+          # не расставлен на всех шести одинаково.
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-shard-0-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-shard-0
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-shard-0
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-shard-1-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-shard-1
+  namespace: gosplash
+  labels:
+    app: pg-shard-1
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-shard-1
+  template:
+    metadata:
+      labels:
+        app: pg-shard-1
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          envFrom:
+            - configMapRef:
+                name: postgres-env
+          # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
+          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # просто лишняя запись в WAL без потребителя, поэтому параметр
+          # не расставлен на всех шести одинаково.
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-shard-1-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-shard-1
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-shard-1
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-catalog-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-catalog
+  namespace: gosplash
+  labels:
+    app: pg-catalog
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-catalog
+  template:
+    metadata:
+      labels:
+        app: pg-catalog
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          envFrom:
+            - configMapRef:
+                name: postgres-env
+          # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
+          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # просто лишняя запись в WAL без потребителя, поэтому параметр
+          # не расставлен на всех шести одинаково.
+          args: ["-c", "wal_level=logical"]
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-catalog-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-catalog
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-catalog
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-catalog-replica-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-catalog-replica
+  namespace: gosplash
+  labels:
+    app: pg-catalog-replica
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-catalog-replica
+  template:
+    metadata:
+      labels:
+        app: pg-catalog-replica
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          envFrom:
+            - configMapRef:
+                name: postgres-env
+          # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
+          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # просто лишняя запись в WAL без потребителя, поэтому параметр
+          # не расставлен на всех шести одинаково.
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-catalog-replica-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-catalog-replica
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-catalog-replica
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-wallet-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-wallet
+  namespace: gosplash
+  labels:
+    app: pg-wallet
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-wallet
+  template:
+    metadata:
+      labels:
+        app: pg-wallet
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          envFrom:
+            - configMapRef:
+                name: postgres-env
+          # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
+          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # просто лишняя запись в WAL без потребителя, поэтому параметр
+          # не расставлен на всех шести одинаково.
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-wallet-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-wallet
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-wallet
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-order-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-order
+  namespace: gosplash
+  labels:
+    app: pg-order
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pg-order
+  template:
+    metadata:
+      labels:
+        app: pg-order
+    spec:
+      enableServiceLinks: false
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          envFrom:
+            - configMapRef:
+                name: postgres-env
+          # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
+          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # просто лишняя запись в WAL без потребителя, поэтому параметр
+          # не расставлен на всех шести одинаково.
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "gosplash"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pg-order-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-order
+  namespace: gosplash
+spec:
+  selector:
+    app: pg-order
+  ports:
+    - port: 5432
+      targetPort: 5432
+

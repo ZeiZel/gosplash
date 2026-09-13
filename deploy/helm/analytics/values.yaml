@@ -1,0 +1,120 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# analytics-service — значения для deploy/kind, НЕ для прода (список внизу).
+# Общий разбор — в deploy/helm/media/values.yaml. Как и wallet: HTTP-порт
+# существует (для проб), но НЕТ ClusterIP Service — публичного REST у
+# analytics нет (см. Chart.yaml), только headless для gRPC.
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  repository: gosplash/analytics
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+ports:
+  http: 8106
+  grpc: 9106
+  metrics: 8206
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# У analytics ДВА Kafka-консьюмера (views, purchases), но cmd/analytics/
+# main.go ждёт их через waitAll с ОБЩИМ бюджетом 15с (та же функция, что и
+# в catalog) — не по 15с на каждый, как в thumbnail-worker. Итог:
+# 2+15(httpx)+15(grpc)+15(waitAll)+5(otel)=52с + preStop 5с = 57с.
+terminationGracePeriodSeconds: 65
+
+preStop:
+  enabled: true
+  sleepSeconds: 5
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 192Mi
+  limits:
+    memory: 384Mi
+
+# CPU — та же оговорка, что и у catalog: правильная метрика для
+# consumer-половины (views/purchases) — лаг партиций, не CPU. analytics
+# батчит вставки в ClickHouse (см. pkg/config AnalyticsConfig.ViewBatchSize) —
+# отставание проявляется в размере накопленного батча и задержке коммита
+# оффсета, а не в загрузке CPU. CPU оставлен как baseline-автоскейл, не
+# как решённая задача — см. тот же разбор в deploy/helm/catalog/values.yaml.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+metrics:
+  scrape: true
+  path: /metrics
+
+config:
+  ANALYTICS_HTTP_ADDR: ":8106"
+  ANALYTICS_GRPC_ADDR: ":9106"
+  ANALYTICS_METRICS_ADDR: ":8206"
+
+  CLICKHOUSE_ADDR: "clickhouse:9000"
+  CLICKHOUSE_DB: "gosplash"
+  CLICKHOUSE_USER: "gosplash"
+
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_CONSUMER_GROUP_ANALYTICS: "analytics"
+
+  ANALYTICS_CH_BATCH_SIZE: "1000"
+  ANALYTICS_CH_FLUSH_INTERVAL: "5s"
+  ANALYTICS_CH_PURCHASE_BATCH_SIZE: "100"
+  ANALYTICS_CH_PURCHASE_FLUSH_INTERVAL: "5s"
+
+  GRPC_DEFAULT_TIMEOUT: "5s"
+
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+  ENVIRONMENT: "kind"
+  LOG_LEVEL: "info"
+
+secrets:
+  # clickhouse — Service из deploy/kind/infra/clickhouse.yaml. Пароль в
+  # Secret — тот же критерий разделения, что и для DSN (см.
+  # deploy/helm/media/values.yaml): доступ к аналитике по чужому паролю
+  # так же нежелателен, как доступ к чужой Postgres, хотя данные здесь
+  # агрегаты, а не деньги.
+  CLICKHOUSE_PASSWORD: "gosplash"
+  JWT_SECRET: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ОБЯЗАНО ПОМЕНЯТЬСЯ ДЛЯ ПРОДА — см. deploy/helm/media/values.yaml.
+# ─────────────────────────────────────────────────────────────────────────────

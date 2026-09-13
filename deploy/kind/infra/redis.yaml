@@ -1,0 +1,102 @@
+# Redis для kind — один инстанс на весь стенд, зеркалирует
+# deploy/compose/redis.yml (тот же образ и политика вытеснения). Простой
+# манифест: Redis здесь ТОЛЬКО кэш/лок/rate-limit (см. комментарий в
+# deploy/compose/redis.yml — "потеря данных не страшна"), поэтому Sentinel/
+# Redis Operator ради HA не оправданы для одноразового стенда.
+#
+# ── СОЗНАТЕЛЬНО БЕЗ PersistentVolumeClaim (проверено на факте) ─────────────
+# Первая версия этой правки добавила PVC и на Redis — "раз уж переводим
+# всё хранящее состояние", единообразно с остальными восемью. На живом
+# прогоне выяснилось, что PVC был подключён, но НЕ ИСПОЛЬЗОВАЛСЯ: контейнер
+# запускается командой `redis-server --maxmemory ... --maxmemory-policy ...`
+# БЕЗ конфиг-файла и БЕЗ `--save`/`--appendonly` — то есть Redis ничего не
+# пишет на диск вообще, том остаётся физически пустым, а "PVC Bound"
+# создавал впечатление персистентности, которой на самом деле нет. Это тот
+# самый худший вид дефекта — выглядит рабочим, будучи бесполезным.
+#
+# Дальше встал реальный вопрос: а нужна ли Redis'у персистентность вообще?
+# В проекте есть ДВА потребителя Redis — кэш/rate-limit/локи (везде "потеря
+# нормальна") и order-service, где Redis участвует в idempotency-key поверх
+# HTTP-запросов на размещение заказа (pkg/redisx.Client.Begin/Complete). На
+# первый взгляд это похоже на случай, где потеря ключа опасна — повторный
+# запрос с тем же Idempotency-Key после потери ключа может списать деньги
+# дважды. Разбор services/order/internal/adapters/idempotency/store.go
+# показывает, что это УЖЕ учтено на уровне архитектуры сервиса, а не только
+# инфраструктуры: Redis там прямо документирован как "ускоритель горячего
+# пути, а не источник правды" (см. package doc), а PostgreSQL — источник
+# правды с атомарным `INSERT ... ON CONFLICT DO NOTHING` (см. beginPG) на
+# КАЖДЫЙ исход, когда Redis отвечает "свободно" (единственный ответ Redis,
+# который в принципе может быть ложным из-за потери ключа). То есть двойное
+# списание при потере ключей Redis невозможно уже сегодня, независимо от
+# того, есть у Redis persistence или нет, — сервис написан с явным
+# расчётом на то, что Redis может забыть всё.
+#
+# Вывод: добавлять PVC (и `--appendonly yes`/`--save`, чтобы он не был
+# пустой декорацией) означало бы чинить проблему, которой нет НИ У ОДНОГО
+# реального потребителя Redis в этом проекте, и тратить строки на
+# защиту от сценария, который order-service уже закрыл на своём уровне.
+# Оставлено БЕЗ PVC, как и было изначально, — но теперь это подтверждённое
+# чтением кода решение, а не то, что "просто не тронули".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: gosplash
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      containers:
+        - name: redis
+          image: redis:8-alpine
+          command:
+            - redis-server
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - allkeys-lru
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: gosplash
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379

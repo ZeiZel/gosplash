@@ -1,0 +1,238 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Kafka для kind — один брокер в режиме KRaft, тот же образ и та же схема
+# ролей, что и в deploy/compose/kafka.yml. Простой манифест, а не
+# bitnami/kafka chart или Strimzi-оператор — по той же причине, что и
+# Postgres (см. deploy/kind/infra/postgres.yaml): один брокер без репликации
+# партиций не нуждается ни в чём из того, что даёт оператор (multi-broker
+# rack awareness, автоматическая ротация серверов), а разворачивать
+# Strimzi (CRD + собственный контроллер) ради одного пода — использовать
+# кран, чтобы налить стакан воды.
+#
+# advertised listener — kafka:9092 (короткое DNS-имя внутри namespace
+# gosplash), а не localhost и не FQDN — см. комментарий в
+# deploy/kind/infra/namespace.yaml про единый namespace.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kafka-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: gosplash
+  labels:
+    app: kafka
+spec:
+  replicas: 1
+  # strategy: Recreate — ОБЯЗАТЕЛЬНО по двум независимым причинам.
+  # (1) KAFKA_NODE_ID=1 зафиксирован ниже — два процесса с ОДНИМ и тем же
+  # node id в KRaft-quorum ломают друг друга по контроллерному соединению
+  # (см. разбор инцидента при живом прогоне — оба пода видят "controller"
+  # по имени Service и путают, кто есть кто), даже если бы RollingUpdate
+  # (умолчание Deployment) продержал их живыми одновременно всего пару
+  # секунд. Это единственная причина, по которой для Kafka имело бы
+  # смысл рассмотреть StatefulSet (стабильное порядковое имя pod'а как
+  # естественный источник node id при нескольких брокерах) — но при
+  # replicas: 1 порядковая идентичность ничего не даёт по сравнению с
+  # тем, что уже даёт Service "kafka": StatefulSet здесь был бы
+  # архитектурой ради будущего, которого в этом файле нет, а не ради
+  # сегодняшней задачи.
+  # (2) Volume теперь ReadWriteOnce PersistentVolumeClaim (см. PVC выше):
+  # RollingUpdate попытался бы поднять новый под, ПОКА старый ещё держит
+  # том, — и завис бы в Pending намертво, потому что RWO-том монтируется
+  # ровно в один под одновременно.
+  # Recreate убивает старый под (и освобождает и node id, и том) ДО
+  # создания нового — гонки не возникает вообще ни по одной из причин.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      # fsGroup — развёрнутый комментарий в deploy/kind/infra/postgres.yaml
+      # (перед ConfigMap postgres-env). Для ЭТОГО образа он не факультативен,
+      # в отличие от postgres: apache/kafka бежит СРАЗУ от непривилегированного
+      # пользователя, без entrypoint'а, который бы сам chown'ил точку
+      # монтирования, — без fsGroup первая же запись в /var/lib/kafka/data
+      # на свежесозданном local-path-томе (владелец root:root, 0700) падает
+      # permission denied.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: kafka
+          image: apache/kafka:4.0.0
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            # localhost, А НЕ Service "kafka" — НЕОЧЕВИДНОЕ РЕШЕНИЕ, отличающее
+            # этот файл от deploy/compose/kafka.yml (там "kafka:9093" работает,
+            # потому что в docker-сети "kafka" резолвится прямо в IP того же
+            # контейнера). В Kubernetes "kafka:9093" — это ClusterIP Service,
+            # то есть отдельный слой DNAT (kube-proxy/iptables) МЕЖДУ подом
+            # и им же самим — проверено на этой машине: брокер с ролями
+            # broker+controller в одном поде НЕ смог достучаться сам до себя
+            # через Service ("Connection to node 1 (kafka/10.96.x.x:9093)
+            # could not be established", broker висел в бесконечном ретрае
+            # регистрации контроллера). Controller-канал для ОДНОГО узла,
+            # который сам себе и брокер, и контроллер, — это внутрипроцессный
+            # разговор, которому нет причин выходить за пределы пода вообще;
+            # localhost убирает Service из этого пути полностью.
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENERS
+              value: "INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            # Внутри кластера ничего снаружи не подключается — в отличие
+            # от docker-compose, EXTERNAL-листенер здесь не нужен вообще,
+            # это единственное отличие от deploy/compose/kafka.yml.
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "INTERNAL://kafka:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "INTERNAL"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            # НЕОЧЕВИДНОЕ РЕШЕНИЕ, найденное на факте живого прогона (см.
+            # отчёт по этой задаче): образ apache/kafka по умолчанию пишет
+            # KRaft-хранилище (meta.properties, логи партиций) в
+            # /tmp/kraft-combined-logs (см. /etc/kafka/docker/server.properties
+            # ВНУТРИ образа) — путь, НИКАК не связанный с volumeMounts ниже.
+            # Смонтированный PVC на /var/lib/kafka/data оставался пустым, а
+            # реальные данные лежали в writable-слое контейнера и исчезали
+            # при пересоздании пода — PVC был подключён, но не использовался,
+            # то есть выглядел рабочим, не будучи им. KAFKA_LOG_DIRS — это
+            # переменная, которой официальный entrypoint образа (см.
+            # /etc/kafka/docker/launch → KafkaDockerWrapper setup) реально
+            # подставляет log.dirs в server.properties; направляем её на тот
+            # же путь, что и volumeMounts.
+            #
+            # Идемпотентность форматирования хранилища при перезапуске: КОГДА
+            # KAFKA_LOG_DIRS указывает на PVC, meta.properties (с cluster.id)
+            # переживает под, и entrypoint при следующем старте видит "уже
+            # отформатировано" (grep "already formatted" в launch-скрипте
+            # образа) и НЕ форматирует диск заново. CLUSTER_ID отдельно
+            # фиксировать не нужно: /etc/kafka/docker/configureDefaults
+            # ВНУТРИ образа уже задаёт ему фиксированное дефолтное значение
+            # ("5L6g3nShT-eMCtK--X86sw"), если переменная не передана явно, —
+            # то есть между рестартами ОДНОГО И ТОГО ЖЕ образа cluster id и
+            # так не меняется, дело было исключительно в log.dirs.
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+          ports:
+            - containerPort: 9092
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: kafka-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: gosplash
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: internal
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+
+---
+# PATTERN: init-Job вместо init-контейнера в самом брокере — топики нужны
+# СРАЗУ ПОСЛЕ первого старта, но НЕ на каждом рестарте пода (kafka-topics.sh
+# --if-not-exists и так идемпотентен, но гонять его при каждом рестарте
+# брокера — лишняя работа и лишняя точка отказа при readiness-race). Job
+# запускается один раз в рамках `make kind-up` (см. mk/k8s.mk) ПОСЛЕ того,
+# как Service kafka уже отвечает, и завершается — тот же приём, что
+# kafka-init в deploy/compose/kafka.yml, перенесённый на Job вместо
+# "ещё одного контейнера в compose".
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics-init
+  namespace: gosplash
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+      containers:
+        - name: kafka-topics-init
+          image: apache/kafka:4.0.0
+          command: ["/bin/sh", "-c"]
+          # Список топиков и партиций — дословно deploy/compose/kafka.yml
+          # (kafka-init), см. там подробные комментарии про конвенцию имён
+          # (docs/adr/0003) и выбор числа партиций.
+          args:
+            - |
+              set -e
+              BS=kafka:9092
+              create() { /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BS --create --if-not-exists --topic $1 --partitions $2 --replication-factor 1; }
+              create media.photo.uploaded              6
+              create media.photo.uploaded.retry        6
+              create media.photo.uploaded.dlq          1
+              create media.photo.thumbnail-ready       6
+              create media.photo.thumbnail-ready.retry 6
+              create media.photo.thumbnail-ready.dlq   1
+              create media.photo.deleted               3
+              create catalog.listing.published         6
+              create order.order.placed                3
+              create order.order.paid                  3
+              create wallet.account.debited            3
+              create analytics.photo.viewed            6
+              echo 'Topics:'
+              /opt/kafka/bin/kafka-topics.sh --bootstrap-server $BS --list

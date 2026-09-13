@@ -1,0 +1,141 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# order-service, HTTP+gRPC API (cmd/order) — значения для deploy/kind, НЕ
+# для прода (список внизу). Общий разбор — в deploy/helm/media/values.yaml.
+#
+# НЕ ПУТАТЬ С deploy/helm/order-worker: это ДВА РАЗНЫХ Deployment для
+# ОДНОГО go-модуля gosplash/services/order (см. Chart.yaml обоих чартов
+# и package doc services/order/cmd/order/main.go — там разбор, почему это
+# два процесса с разными профилями масштабирования).
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  repository: gosplash/order
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+ports:
+  http: 8104
+  grpc: 9104
+  metrics: 8205
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# cmd/order (в отличие от cmd/worker) не ждёт Kafka-консьюмеров при
+# остановке — только outbox-relay через defer Close() (не блокирующее
+# ожидание). Худший случай: 2+15(httpx)+15(grpc)+5(otel)=37с + preStop 5с.
+terminationGracePeriodSeconds: 50
+
+preStop:
+  enabled: true
+  sleepSeconds: 5
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+# CPU — order-api принимает HTTP/gRPC-запросы синхронно (миллисекунды),
+# сагу лишь ЗАПУСКАЕТ и не ждёт её завершения (см. package doc
+# cmd/order/main.go) — то есть его нагрузка это именно "запросов в секунду",
+# а не "лаг очереди", и CPU здесь адекватная метрика (в отличие от
+# order-worker, см. его values.yaml).
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+service:
+  http:
+    type: ClusterIP
+
+metrics:
+  scrape: true
+  path: /metrics
+
+config:
+  ORDER_HTTP_ADDR: ":8104"
+  ORDER_GRPC_ADDR: ":9104"
+  ORDER_METRICS_ADDR: ":8205"
+
+  # temporal — Service из deploy/kind/infra/temporal.yaml, порт 7233 —
+  # тот же самый Temporal Frontend, который используют и cmd/order (клиент,
+  # запускает воркфлоу), и cmd/worker (регистрирует воркфлоу/activities).
+  TEMPORAL_ADDRESS: "temporal:7233"
+  TEMPORAL_NAMESPACE: "gosplash"
+  TEMPORAL_TASK_QUEUE: "order-saga"
+
+  IDEMPOTENCY_TTL: "24h"
+
+  # wallet-grpc/catalog-grpc — headless Service'ы чартов wallet/catalog
+  # (тот же namespace, релизы названы так же, как чарты — см. mk/k8s.mk).
+  WALLET_GRPC_TARGET: "wallet-grpc:9103"
+  CATALOG_GRPC_TARGET: "catalog-grpc:9102"
+
+  KAFKA_BROKERS: "kafka:9092"
+  OUTBOX_POLL_INTERVAL: "1s"
+  OUTBOX_BATCH_SIZE: "100"
+
+  REDIS_ADDR: "redis:6379"
+  REDIS_DB: "0"
+  REDIS_POOL_SIZE: "20"
+  REDIS_MAX_RETRIES: "3"
+  REDIS_DIAL_TIMEOUT: "2s"
+  REDIS_READ_TIMEOUT: "500ms"
+
+  GRPC_DEFAULT_TIMEOUT: "5s"
+
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+  ENVIRONMENT: "kind"
+  LOG_LEVEL: "info"
+
+secrets:
+  # pg-order — Service из deploy/kind/infra/postgres.yaml. ТА ЖЕ база,
+  # на которую пишет и cmd/worker (см. deploy/helm/order-worker) —
+  # ConfirmOrder пишет order.order.paid в ту же таблицу outbox_order,
+  # это одна БД для обоих процессов (см. package doc cmd/order/main.go).
+  ORDER_DSN: "host=pg-order port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+  JWT_SECRET: ""
+  REDIS_PASSWORD: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ОБЯЗАНО ПОМЕНЯТЬСЯ ДЛЯ ПРОДА — см. deploy/helm/media/values.yaml.
+# ORDER_DSN обязан совпадать с тем, что задан в deploy/helm/order-worker —
+# два чарта, ОДНА база; расхождение значений между values этих двух
+# чартов — прямой путь потерять заказы (см. docs/runbooks/kubernetes.md).
+# ─────────────────────────────────────────────────────────────────────────────

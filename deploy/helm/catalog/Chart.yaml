@@ -1,0 +1,9 @@
+apiVersion: v2
+name: catalog
+description: >-
+  gosplash catalog-service — реплицированная витрина карточек. HTTP
+  (публичный) + gRPC (межсервисный, headless — см. docs/adr/0015) +
+  Kafka-консьюмеры + outbox-relay внутри одного процесса.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

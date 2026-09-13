@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# search-service — значения для deploy/kind, НЕ для прода (список внизу).
+# Общий разбор — в deploy/helm/media/values.yaml. Как analytics/wallet:
+# HTTP-порт есть (для проб), но НЕТ ClusterIP Service — только headless
+# для gRPC, публичного REST нет.
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  repository: gosplash/search
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+ports:
+  http: 8107
+  grpc: 9107
+  metrics: 8207
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# cmd/search/main.go на остановке ждёт ОДИН consumerDone (не retry-консьюмер)
+# одним select с таймаутом 15с, затем bulkIndexer.Close() (не ограничен по
+# времени явно, но дожидается только последней уже накопленной пачки —
+# на практике быстро). Итог: 2+15(httpx)+15(grpc)+15(consumer)+5(otel)=52с
+# + preStop 5с = 57с. Берём с запасом, как у catalog/analytics.
+terminationGracePeriodSeconds: 65
+
+preStop:
+  enabled: true
+  sleepSeconds: 5
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 256Mi   # BulkIndexer копит пачку документов в памяти до флаша
+  limits:
+    memory: 384Mi
+
+# CPU — та же оговорка про Kafka-консьюмер, что и у catalog/analytics:
+# правильная метрика — лаг топика catalog.listing.published, а не CPU
+# (индексация в Elasticsearch — это в основном сеть, а не счёт). CPU —
+# baseline, не решение.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+metrics:
+  scrape: true
+  path: /metrics
+
+config:
+  SEARCH_HTTP_ADDR: ":8107"
+  SEARCH_GRPC_ADDR: ":9107"
+  SEARCH_METRICS_ADDR: ":8207"
+
+  # elasticsearch — Service из deploy/kind/infra/elasticsearch.yaml.
+  # security выключена (xpack.security.enabled=false, см.
+  # deploy/compose/elasticsearch.yml) — учебный стенд без аутентификации,
+  # поэтому здесь нет ES_PASSWORD и, соответственно, нет secrets ниже:
+  # заводить пустой Secret ради формы было бы имитацией безопасности,
+  # а не безопасностью (см. отчёт по фазе 6 — прод обязан включить
+  # security и завести реальный Secret).
+  ELASTICSEARCH_ADDRS: "http://elasticsearch:9200"
+  SEARCH_INDEX_ALIAS: "listings"
+
+  KAFKA_BROKERS: "kafka:9092"
+  KAFKA_CONSUMER_GROUP_SEARCH: "search"
+
+  GRPC_DEFAULT_TIMEOUT: "5s"
+
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+  ENVIRONMENT: "kind"
+  LOG_LEVEL: "info"
+
+secrets:
+  JWT_SECRET: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ОБЯЗАНО ПОМЕНЯТЬСЯ ДЛЯ ПРОДА — см. deploy/helm/media/values.yaml.
+# Дополнительно: включить xpack.security.enabled в самом Elasticsearch
+# (deploy/kind/infra/elasticsearch.yaml — вне зоны прод-конфигурации,
+# но чарт search тогда обязан получить ELASTICSEARCH_* креды в secrets).
+# ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,114 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# order-service, Temporal worker (cmd/worker) — значения для deploy/kind, НЕ
+# для прода (список внизу). Общий разбор resources/ConfigMap-Secret — в
+# deploy/helm/media/values.yaml. У ЭТОГО чарта НЕТ probes/preStop/Service —
+# см. развёрнутое объяснение в templates/deployment.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  repository: gosplash/order-worker
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Единица масштабирования — количество ОДНОВРЕМЕННО исполняющихся саг, а не
+# входящих HTTP-запросов (см. package doc cmd/order/main.go). Temporal сам
+# распределяет task'и между воркерами через task queue — добавление реплики
+# просто добавляет ещё одного потребителя очереди, без переконфигурации.
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ── terminationGracePeriodSeconds: консервативная оценка ────────────────────
+# В отличие от httpx/grpcx-сервисов, здесь нет явных таймаутов в коде этого
+# проекта — sdkworker.Run(InterruptCh()) делегирует остановку Temporal SDK
+# целиком (см. templates/deployment.yaml, полный разбор). 90с — оценка
+# "с большим запасом", а не расчёт: она рассчитана на то, что активности
+# саги (ReserveFunds/GrantLicense/…) сами ограничены resilience.
+# DefaultRetryConfig — сотни миллисекунд на попытку, не минуты, — то есть
+# реалистичный "хвост" одной активности короткий, но точных чисел нет.
+terminationGracePeriodSeconds: 90
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+# ── HPA: CPU здесь ЕЩЁ ХУЖЕ прокси-метрика, чем для Kafka-консьюмеров ───────
+#
+# Правильная метрика для этого воркера — Temporal task-queue backlog
+# (schedule-to-start latency: сколько задача ждёт свободного воркера) или
+# число одновременно выполняющихся Workflow Task'ов, а НЕ Kafka lag (у
+# order-worker вообще нет Kafka-потребления — сага общается с wallet/catalog
+# по gRPC, а не забирает события из топика) и НЕ CPU.
+#
+# Почему именно CPU здесь особенно вводит в заблуждение: activity саги
+# (ReserveFunds, GrantLicense, ConfirmOrder) — это в основном ОЖИДАНИЕ
+# ответа по сети (gRPC до wallet/catalog) и ретраи с backoff, а не счёт —
+# воркер может держать десятки одновременных саг, почти не потребляя CPU,
+# и в это же время schedule-to-start latency растёт, потому что воркеров
+# физически не хватает разгрести очередь задач. CPU-based HPA в этой
+# ситуации НЕ заскейлится вообще — именно тот случай, когда метрика лжёт
+# "всё в порядке" ровно в момент реальной перегрузки.
+#
+# Оставлен CPU-таргет как baseline (лучше грубый автоскейл, чем никакого),
+# но эксплуатационно iнформативнее — Temporal Web UI (task queue backlog)
+# и алерт на схема-to-start latency, а не эта HPA. Настоящая реализация —
+# кастомный exporter метрик Temporal + Prometheus Adapter/KEDA
+# ScaledObject, вне объёма фазы 6 (см. docs/PLAN.md).
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+config:
+  # Тот же случай, что и у media: воркер саги сам топиков не читает, но
+  # публикует order.order.placed и order.order.paid через outbox-relay.
+  KAFKA_BROKERS: "kafka:9092"
+
+  TEMPORAL_ADDRESS: "temporal:7233"
+  TEMPORAL_NAMESPACE: "gosplash"
+  TEMPORAL_TASK_QUEUE: "order-saga"
+
+  # wallet-grpc/catalog-grpc — те же headless Service, что и у cmd/order
+  # (см. deploy/helm/order/values.yaml) — activities саги ходят туда
+  # напрямую, минуя API-процесс.
+  WALLET_GRPC_TARGET: "wallet-grpc:9103"
+  CATALOG_GRPC_TARGET: "catalog-grpc:9102"
+
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+  ENVIRONMENT: "kind"
+  LOG_LEVEL: "info"
+
+secrets:
+  # ТА ЖЕ база, что и у deploy/helm/order (cmd/order) — activities читают
+  # и пишут таблицу orders наравне с API-процессом (см. package doc
+  # cmd/worker/main.go: "activities читают/пишут ту же таблицу orders").
+  # Значение ОБЯЗАНО совпадать с order.secrets.ORDER_DSN дословно.
+  ORDER_DSN: "host=pg-order port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ОБЯЗАНО ПОМЕНЯТЬСЯ ДЛЯ ПРОДА — см. deploy/helm/media/values.yaml.
+# Дополнительно для этого чарта: terminationGracePeriodSeconds стоит
+# пересчитать по факту (см. Temporal-метрики WorkflowTaskExecutionLatency
+# в реальном кластере, а не оставлять оценку "с запасом" из этого файла).
+# ─────────────────────────────────────────────────────────────────────────────

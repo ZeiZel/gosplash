@@ -1,0 +1,9 @@
+apiVersion: v2
+name: analytics
+description: >-
+  gosplash analytics-service — агрегаты просмотров и покупок поверх
+  ClickHouse. gRPC (публичная витрина отчётов, headless — см.
+  docs/adr/0015) + Kafka-консьюмеры; публичного REST нет.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

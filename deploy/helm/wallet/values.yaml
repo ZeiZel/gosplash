@@ -1,0 +1,121 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# wallet-service — значения по умолчанию для deploy/kind, НЕ для прода
+# (список внизу). Общий разбор probes/terminationGracePeriodSeconds/preStop/
+# resources/ConfigMap-Secret — в deploy/helm/media/values.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  repository: gosplash/wallet
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# 2 реплики — тот же минимум для headless round_robin, что и у остальных.
+# Деньги НЕ требуют лидера/единственной реплики: атомарность обеспечивает
+# ACID-транзакция Postgres внутри CommitFunds (см. package doc
+# services/wallet/cmd/wallet/main.go), а не то, что запрос всегда обслуживает
+# один и тот же процесс.
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# HTTP-порт у wallet СУЩЕСТВУЕТ (используется kubelet'ом для проб), но это
+# ТОЛЬКО /healthz и /readyz — публичного REST нет (см. Chart.yaml). Именно
+# поэтому в этом чарте, в отличие от media/catalog/order, НЕТ файла
+# templates/service-http.yaml: заводить ClusterIP Service ради порта, в
+# который никто, кроме kubelet'а по IP пода, не должен ходить, — значит
+# создавать сетевой путь без потребителя и без причины его защищать
+# (NetworkPolicy на "то, чего нет" не пишут). Единственный официальный
+# вход в деньги — gRPC :9103 через headless Service ниже (docs/adr/0015).
+ports:
+  http: 8103
+  grpc: 9103
+  metrics: 8204
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# У wallet нет Kafka-консьюмера для ожидания на остановке (outbox-relay есть,
+# но main.go не блокирует shutdown его ожиданием явно — только defer Close).
+# Худший случай: 2(sleep)+15(httpx)+15(grpc)+5(otel)=37с внутри процесса +
+# 5с preStop = 42с. Берём с запасом.
+terminationGracePeriodSeconds: 50
+
+preStop:
+  enabled: true
+  sleepSeconds: 5
+
+# requests чуть выше media/catalog: денежные операции держат более длинные
+# транзакции (резерв → коммит/релиз через два шага саги), это ощутимо для
+# CPU/памяти пула соединений при параллельных сагах.
+resources:
+  requests:
+    cpu: 150m
+    memory: 192Mi
+  limits:
+    memory: 320Mi
+
+# CPU — не консьюмер, gRPC-нагрузка от саги. Адекватная метрика.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 70
+
+metrics:
+  scrape: true
+  path: /metrics
+
+config:
+  WALLET_HTTP_ADDR: ":8103"
+  WALLET_GRPC_ADDR: ":9103"
+  WALLET_METRICS_ADDR: ":8204"
+
+  KAFKA_BROKERS: "kafka:9092"
+  OUTBOX_POLL_INTERVAL: "1s"
+  OUTBOX_BATCH_SIZE: "100"
+
+  GRPC_DEFAULT_TIMEOUT: "5s"
+
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+  ENVIRONMENT: "kind"
+  LOG_LEVEL: "info"
+
+secrets:
+  # pg-wallet — Service из deploy/kind/infra/postgres.yaml.
+  WALLET_DSN: "host=pg-wallet port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+  JWT_SECRET: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ЧТО ОБЯЗАНО ПОМЕНЯТЬСЯ ДЛЯ ПРОДА — см. deploy/helm/media/values.yaml.
+# Для wallet особенно критично: WALLET_DSN и JWT_SECRET — деньги, а не
+# карточки фото; пароль "gosplash" в открытом values.yaml допустим ТОЛЬКО
+# для одноразового kind-стенда на ноутбуке.
+# ─────────────────────────────────────────────────────────────────────────────

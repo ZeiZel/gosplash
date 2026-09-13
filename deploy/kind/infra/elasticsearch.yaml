@@ -1,0 +1,120 @@
+# Elasticsearch для kind — зеркалирует deploy/compose/elasticsearch.yml
+# (single-node, security выключена — то же самое "только для локального
+# стенда" предупреждение, см. комментарий в оригинале и в
+# deploy/helm/search/values.yaml, раздел "что менять для прода"). Как и
+# ClickHouse, явно не назван в задании, но без него search-service никогда
+# не станет ready (health.Register "elasticsearch", cmd/search/main.go).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elasticsearch-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch
+  namespace: gosplash
+  labels:
+    app: elasticsearch
+spec:
+  replicas: 1
+  # strategy: Recreate — ОБЯЗАТЕЛЬНО при ReadWriteOnce PersistentVolumeClaim
+  # (том ниже). RollingUpdate (умолчание Deployment) на несколько секунд
+  # держит ДВА пода одновременно — старый ещё не убит, новый уже создан.
+  # С RWO-томом это не split-brain, а жёсткий Pending: том монтируется
+  # РОВНО в один под одновременно, и kubelet нового пода не сможет
+  # примонтировать том, уже занятый старым, — RollingUpdate виснет
+  # навсегда без ручного вмешательства. Recreate прямо говорит Kubernetes:
+  # сначала убей старый под и дождись, пока он освободит том, потом
+  # создавай новый.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      # fsGroup — развёрнутый комментарий в deploy/kind/infra/postgres.yaml
+      # (перед ConfigMap postgres-env). Для ЭТОГО образа он не факультативен:
+      # официальный образ Elasticsearch бежит от пользователя elasticsearch
+      # (UID 1000) без стартового chown, и это ХОРОШО ЗАДОКУМЕНТИРОВАННАЯ
+      # проблема самого Elastic для любого внешнего тома — без fsGroup
+      # процесс падает на старте с AccessDeniedException на каталоге данных.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.19.11
+          env:
+            - name: discovery.type
+              value: "single-node"
+            - name: xpack.security.enabled
+              value: "false"
+            - name: ES_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+            - name: cluster.routing.allocation.disk.threshold_enabled
+              value: "false"
+          ports:
+            - containerPort: 9200
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+          readinessProbe:
+            # httpGet проверяет только код ответа (200), не тело:
+            # /_cluster/health отвечает 200 даже при status=red (это
+            # обычный HTTP-эндпоинт, а не readinessProbe API). Честная
+            # проверка status потребовала бы exec с curl+grep, как в
+            # healthcheck deploy/compose/elasticsearch.yml — для
+            # одноразового демо-стенда "порт отвечает" достаточный
+            # опережающий сигнал: красный кластер всё равно будет виден
+            # по ошибке health.Register("elasticsearch", ...) в /readyz
+            # search-service.
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9200
+            initialDelaySeconds: 40
+            periodSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: elasticsearch-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: gosplash
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - port: 9200
+      targetPort: 9200

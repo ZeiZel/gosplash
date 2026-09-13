@@ -1,0 +1,9 @@
+apiVersion: v2
+name: media
+description: >-
+  gosplash media-service — приём загрузок в шардированное хранилище и раздача
+  оригиналов. HTTP (публичный) + gRPC (межсервисный, headless — см.
+  docs/adr/0015) + outbox-relay внутри одного процесса.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

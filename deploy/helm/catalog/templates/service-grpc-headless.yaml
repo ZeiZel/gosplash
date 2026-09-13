@@ -1,0 +1,35 @@
+# PATTERN: headless Service для gRPC — см. docs/adr/0015 целиком, здесь
+# только то, что относится непосредственно к манифесту.
+#
+# clusterIP: None — вот и всё решение ADR с точки зрения Kubernetes API:
+# без единого виртуального IP DNS-запрос к "catalog-grpc" отдаёт A-записи
+# ВСЕХ подов сервиса, а не адрес одного kube-proxy-балансировщика. Дальше
+# балансировку делает уже клиент — pkg/grpcx.Dial с round_robin
+# (grpc.WithDefaultServiceConfig, см. client.go) держит по соединению на
+# каждый адрес из списка и раскидывает RPC между ними.
+#
+# publishNotReadyAddresses ЯВНО оставлен false (это default, но ADR 0015
+# в разделе "Риск" отдельно требует проверить именно это при написании
+# чарта — см. цитату там: "должен быть проверен отдельно при написании
+# Helm-чарта в фазе 6"). Проверено: false — то же поведение, что и у
+# обычного ClusterIP Service — в Endpoints/EndpointSlice попадают ТОЛЬКО
+# адреса подов, прошедших readinessProbe. Если бы это было true (как,
+# например, осознанно делают headless Service перед StatefulSet ради
+# раннего peer discovery), gRPC-резолвер получал бы в DNS-ответе И ещё не
+# готовые поды, и round_robin отправлял бы часть RPC туда, где readyz ещё
+# красный, — риск, который явно описан в ADR, и вот его закрытие.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "catalog.fullname" . }}-grpc
+  labels:
+    {{- include "catalog.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    {{- include "catalog.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      targetPort: grpc

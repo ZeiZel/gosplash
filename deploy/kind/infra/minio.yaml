@@ -1,0 +1,164 @@
+# MinIO для kind — зеркалирует deploy/compose/minio.yml (тот же образ и
+# креды gosplash/gosplash). Простой манифест, не bitnami/minio-tenant-
+# оператор: нужен ОДИН S3-совместимый бакет-сервер без erasure coding и
+# multi-node distributed mode — учебная нагрузка (несколько загрузок за
+# демо-сессию) на порядки меньше того, ради чего distributed MinIO вообще
+# существует.
+#
+# НЕОЧЕВИДНОЕ РЕШЕНИЕ: образы — quay.io/minio/{minio,mc}, А НЕ
+# docker.io/minio/{minio,mc}, как в deploy/compose/minio.yml. Проверено
+# при первом `make kind-up` на этой машине: docker.io/minio/minio и
+# docker.io/minio/mc с 2024 года недоступны анонимным docker pull
+# ("pull access denied... repository does not exist") — MinIO ограничил
+# публичный доступ к Docker Hub после смены лицензии, а зеркало на
+# quay.io (то же самое содержимое, тот же тег latest) осталось открытым.
+# Это, судя по всему, ЛОМАЕТ и docker-compose (deploy/compose/minio.yml
+# использует те же docker.io-образы) — не в зоне ответственности этой
+# задачи, но стоит сообщить интегратору отдельно.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: gosplash
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: gosplash
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  # strategy: Recreate — ОБЯЗАТЕЛЬНО при ReadWriteOnce PersistentVolumeClaim
+  # (том ниже). RollingUpdate (умолчание Deployment) на несколько секунд
+  # держит ДВА пода одновременно — старый ещё не убит, новый уже создан.
+  # С RWO-томом это не split-brain, а жёсткий Pending: том монтируется
+  # РОВНО в один под одновременно, и kubelet нового пода не сможет
+  # примонтировать том, уже занятый старым, — RollingUpdate виснет
+  # навсегда без ручного вмешательства. Recreate прямо говорит Kubernetes:
+  # сначала убей старый под и дождись, пока он освободит том, потом
+  # создавай новый.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      # enableServiceLinks: false — иначе kubelet инжектит в КАЖДЫЙ под
+      # namespace'а переменные вида <ИМЯ_СЕРВИСА>_PORT для ВСЕХ Service,
+      # существовавших на момент его создания ("Docker links", легаси-
+      # поведение Kubernetes). Конкретно на этом стенде это СЛОМАЛО
+      # temporal-ui: его собственный config template ждёт числовой порт
+      # в одном из полей, а Kubernetes подставил TEMPORAL_PORT=tcp://IP:7233
+      # (адрес Service "temporal") в переменную с похожим именем — ui упал
+      # с "config file corrupted: cannot unmarshal !!str `tcp://...`
+      # into int". Отключено на ВСЕХ подах инфраструктуры одинаково, а не
+      # только у temporal-ui: остальные сейчас коллизии не показывают
+      # только потому, что их образы её не триггерят СЕЙЧАС, а не потому
+      # что риска нет структурно.
+      enableServiceLinks: false
+      # fsGroup — развёрнутый комментарий в deploy/kind/infra/postgres.yaml
+      # (перед ConfigMap postgres-env). Для ЭТОГО образа он не факультативен:
+      # MinIO бежит от непривилегированного пользователя без стартового
+      # chown точки монтирования, и без fsGroup первая же запись в /data
+      # на свежем local-path-томе (владелец root:root, 0700) падает
+      # permission denied.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: minio
+          # imagePullPolicy: IfNotPresent — ОБЯЗАТЕЛЕН при теге ":latest".
+          # Без него Kubernetes принимает default ЗА тег ":latest" —
+          # imagePullPolicy=Always — и кластер лезет за образом В СЕТЬ
+          # ДАЖЕ КОГДА он уже импортирован в containerd узла (см. разбор
+          # прокси-проблемы в mk/k8s.mk, K8S_INFRA_IMAGES): при недоступном
+          # registry (или недоступном прокси до него) под уходит в
+          # ImagePullBackOff, несмотря на то что `crictl images` на узле
+          # УЖЕ показывает нужный образ. Проверено на этой машине именно
+          # на этом образе — постгрес/кафка/etc с пришпиленными тегами
+          # этой ловушки не показывают (для них default — IfNotPresent).
+          image: quay.io/minio/minio:latest
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              value: "gosplash"
+            - name: MINIO_ROOT_PASSWORD
+              value: "gosplash"
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: gosplash
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+---
+# Job — те же три команды mc, что и minio-init в deploy/compose/minio.yml:
+# создать оба бакета и открыть thumbnails на анонимное чтение.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-bucket-init
+  namespace: gosplash
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+      containers:
+        - name: minio-bucket-init
+          image: quay.io/minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mc alias set local http://minio:9000 gosplash gosplash
+              mc mb --ignore-existing local/gosplash-originals
+              mc mb --ignore-existing local/gosplash-thumbnails
+              mc anonymous set download local/gosplash-thumbnails
+              echo 'Buckets:'
+              mc ls local

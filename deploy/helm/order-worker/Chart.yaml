@@ -1,0 +1,10 @@
+apiVersion: v2
+name: order-worker
+description: >-
+  gosplash order-service, Temporal worker (cmd/worker) — исполняет
+  PlaceOrderWorkflow и её activities. Отдельный чарт от deploy/helm/order
+  (cmd/order, HTTP+gRPC API) — см. package doc services/order/cmd/order/
+  main.go и Chart.yaml deploy/helm/order, почему это два процесса.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

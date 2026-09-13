@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Job, применяющий схему ко всем базам ПЕРЕД тем, как `make k8s-deploy`
+# ставит Helm-релизы сервисов (см. mk/k8s.mk, цель kind-up: порядок —
+# infra-up → migrate → k8s-deploy). Без него все шесть readyz-проверок
+# "postgres" во всех чартах будут висеть в 503 вечно: AutoMigrate из
+# services/*/migrations никогда не запустится сам, сервисы его не делают
+# (docs/STYLE.md/package doc tools/automigrate/cmd/automigrate/main.go:
+# "миграция при старте сервиса" намеренно не сделана — гонка нескольких
+# реплик за DDL).
+#
+# Переменные окружения — ДОСЛОВНО те же значения, что в secrets.* чартов
+# media/catalog/wallet/order (deploy/helm/*/values.yaml): один и тот же
+# gosplash/gosplash, один и тот же набор хостов. Расхождение здесь и там —
+# способ мигрировать не ту базу, в которую реально пойдёт сервис.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: automigrate
+  namespace: gosplash
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: automigrate
+          image: gosplash/automigrate:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MEDIA_SHARD_0_DSN
+              value: "host=pg-shard-0 port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+            - name: MEDIA_SHARD_1_DSN
+              value: "host=pg-shard-1 port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+            - name: CATALOG_DSN
+              value: "host=pg-catalog port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+            - name: CATALOG_REPLICA_DSN
+              value: "host=pg-catalog-replica port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+            # Строку подключения ВЫПОЛНЯЕТ сервер реплики (CREATE
+            # SUBSCRIPTION), поэтому адрес здесь — internal DNS pg-catalog,
+            # тот же принцип, что и в .env.example (см. комментарий там же).
+            - name: CATALOG_REPLICATION_CONN
+              value: "host=pg-catalog port=5432 user=gosplash password=gosplash dbname=gosplash"
+            - name: WALLET_DSN
+              value: "host=pg-wallet port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+            - name: ORDER_DSN
+              value: "host=pg-order port=5432 user=gosplash password=gosplash dbname=gosplash sslmode=disable"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            # UID обязателен ЧИСЛОМ, а не именем. Distroless объявляет
+            # пользователя как "nonroot", и kubelet отказывается запускать
+            # контейнер: проверить, что нечисловой пользователь не root, он
+            # не может (CreateContainerConfigError: image has non-numeric
+            # user). 65532 — это и есть UID nonroot в distroless; чарты
+            # сервисов (deploy/helm/*/values.yaml) задают его так же.
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]

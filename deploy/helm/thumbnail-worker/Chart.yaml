@@ -1,0 +1,9 @@
+apiVersion: v2
+name: thumbnail-worker
+description: >-
+  gosplash thumbnail-worker — генерация превью из Kafka
+  (media.photo.uploaded), запись в S3 и outbox-relay. Публичного API нет —
+  только служебный HTTP (/healthz, /readyz, /metrics, /debug/pprof).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: search
+description: >-
+  gosplash search-service — полнотекстовый поиск по каталогу в
+  Elasticsearch. gRPC (публичная витрина поиска, headless — см.
+  docs/adr/0015) + Kafka-консьюмер (catalog.listing.published); публичного
+  REST нет.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

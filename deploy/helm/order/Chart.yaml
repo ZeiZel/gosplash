@@ -1,0 +1,10 @@
+apiVersion: v2
+name: order
+description: >-
+  gosplash order-service, HTTP+gRPC API (cmd/order) — приём заказов с ключом
+  идемпотентности и запуск саги PlaceOrderWorkflow в Temporal. Исполнение
+  саги — отдельный чарт deploy/helm/order-worker (cmd/worker), см. его
+  Chart.yaml, почему это два процесса и два образа.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

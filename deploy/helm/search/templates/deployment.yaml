@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "search.fullname" . }}
+  labels:
+    {{- include "search.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "search.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "search.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Контрольная сумма ConfigMap в аннотации ПОДА.
+        #
+        # Без неё `helm upgrade`, изменивший только ConfigMap, не трогает
+        # шаблон пода — и Kubernetes не видит причины перекатывать
+        # Deployment. Поды продолжают работать со старой конфигурацией,
+        # команда завершается успехом, а `kubectl get cm` показывает новое
+        # значение: расхождение, которое выглядит как «изменение не
+        # применилось по непонятной причине».
+        #
+        # Поймано ровно так: у media в ConfigMap не было KAFKA_BROKERS,
+        # правка чарта прошла успешно, ConfigMap обновился — а поды
+        # остались прежние, с прежним именем, и relay продолжал биться
+        # в localhost.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.metrics.scrape }}
+        # /metrics отдаётся на СЛУЖЕБНОМ порту (metrics), а не на публичном
+        # http — см. package doc pkg/httpx/server.go (ServeMetricsAndPprof):
+        # наружу его не выставляют, и Prometheus в этом кластере тоже ходит
+        # именно сюда, а не на порт, который слушает NGINX/Ingress.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.metrics | quote }}
+        prometheus.io/path: {{ .Values.metrics.path }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "search.serviceAccountName" . }}
+      # enableServiceLinks: false — иначе kubelet добавляет в ПОД
+      # переменные вида <ИМЯ_СЕРВИСА>_PORT для каждого Service в
+      # namespace (легаси Docker-links, см. разбор в
+      # deploy/kind/infra/temporal.yaml, где эта переменная реально
+      # сломала temporal-ui). У сервисов gosplash сегодня нет
+      # переменной с таким именем среди ключей pkg/config, но правило
+      # проекта "os.Getenv только в pkg/config" не защищает от того,
+      # что сам под увидит лишнюю переменную из окружения — отключаем
+      # инъекцию целиком, а не полагаемся на отсутствие коллизии сегодня.
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Разбор чисел — в values.yaml, здесь только итог.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: search
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+            - name: grpc
+              containerPort: {{ .Values.ports.grpc }}
+            - name: metrics
+              containerPort: {{ .Values.ports.metrics }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "search.fullname" . }}-config
+            - secretRef:
+                name: {{ include "search.fullname" . }}-secret
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- if .Values.preStop.enabled }}
+          lifecycle:
+            preStop:
+              # Экшен sleep, не exec — итоговый образ distroless, внутри нет
+              # ни шелла, ни бинарника sleep. Разбор всего механизма —
+              # в values.yaml (preStop).
+              sleep:
+                seconds: {{ .Values.preStop.sleepSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

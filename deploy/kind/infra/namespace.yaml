@@ -1,0 +1,17 @@
+# Один namespace на весь стенд — и инфраструктура (Postgres/Kafka/Redis/...),
+# и Helm-релизы сервисов. НЕОЧЕВИДНОЕ РЕШЕНИЕ: не разводим их по неймспейсам
+# (например, "gosplash-infra" / "gosplash-apps"), хотя так принято в проде.
+# Причина — тот же выбор, что и "fullname = .Release.Name" в чартах (см.
+# deploy/helm/media/templates/_helpers.tpl): значения вроде "media-grpc:9101"
+# в values.yaml сервисов и "kafka:9092"/"pg-shard-0:5432" здесь — это КОРОТКИЕ
+# DNS-имена, которые Kubernetes резолвит без суффикса ТОЛЬКО внутри одного
+# namespace. Развести на два namespace означало бы либо писать везде
+# полные FQDN (kafka.gosplash-infra.svc.cluster.local — многословно и легко
+# забыть при копипасте values.yaml нового сервиса), либо заводить
+# ExternalName-заглушки. Для одноразового учебного стенда это лишняя
+# сложность без выигрыша (никакой RBAC/квоты между "инфрой" и "приложениями"
+# здесь не разграничиваются).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gosplash

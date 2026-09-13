@@ -1,0 +1,10 @@
+apiVersion: v2
+name: wallet
+description: >-
+  gosplash wallet-service — счета и ledger с двойной записью. Единственный
+  вход в деньги — gRPC (межсервисный, headless — см. docs/adr/0015);
+  публичного HTTP/REST нет намеренно (см. package doc
+  services/wallet/cmd/wallet/main.go).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
