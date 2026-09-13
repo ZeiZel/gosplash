@@ -6,7 +6,7 @@
 #
 # НЕОЧЕВИДНОЕ РЕШЕНИЕ: это ДВА РАЗНЫХ ОБРАЗА для одного go-модуля
 # gosplash/services/order — этот (cmd/order, API) и deploy/docker/
-# Dockerfile.order-worker (cmd/worker, Temporal worker). Дублирование
+# order-worker.Dockerfile (cmd/worker, Temporal worker). Дублирование
 # builder-стадии — прямое следствие решения services/order/cmd/order/main.go
 # (см. его package doc): это два процесса с разными профилями масштабирования
 # и отказа, и в Kubernetes они обязаны быть двумя разными Deployment
@@ -16,30 +16,16 @@
 # image ARG-ом, который легко перепутать при релизе) ради экономии
 # нескольких строк Dockerfile — цена того не стоит.
 #
-# Стратегия сборки монорепы разобрана в deploy/docker/Dockerfile.media.
+# Централизованная сборка (один `go build` в ./build снаружи, а не
+# builder-стадия в образе) и выбор distroless вместо alpine разобраны
+# подробно в deploy/docker/media.Dockerfile.
 # ─────────────────────────────────────────────────────────────────────────────
-
-FROM golang:1.27 AS builder
-WORKDIR /src
-
-COPY go.mod go.sum ./
-COPY pkg/ ./pkg/
-COPY gen/ ./gen/
-COPY services/order/ ./services/order/
-
-WORKDIR /src/services/order
-RUN go mod edit \
-      -require=gosplash@v0.0.0-00010101000000-000000000000 \
-      -replace=gosplash=../../
-
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/order ./cmd/order
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/order /usr/local/bin/order
+# Бинарник уже собран под linux/$(ARCH) снаружи — см. `make build-linux`
+# в корневом Makefile и разбор цены в deploy/docker/media.Dockerfile.
+COPY build/order /usr/local/bin/order
 
 USER nonroot:nonroot
 

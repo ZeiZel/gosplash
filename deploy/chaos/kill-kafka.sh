@@ -3,7 +3,7 @@
 # kill-kafka.sh — роняет Kafka на N секунд и поднимает обратно.
 #
 # ЧТО ЛОМАЕМ
-#   Контейнер kafka (deploy/compose/kafka.yml) останавливается через
+#   Контейнер kafka (deploy/compose/docker-compose.kafka.yml) останавливается через
 #   `docker compose stop`, а не `kill -9` изнутри контейнера: нас интересует
 #   поведение КЛИЕНТОВ (media, catalog, thumbnail-worker) при недоступном
 #   брокере, а не поведение самой Kafka при грязном шатдауне — это другой,

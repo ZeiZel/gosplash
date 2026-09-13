@@ -53,7 +53,7 @@ spec:
       # к Temporal Frontend и забирает задачи, ничего не слушая (см.
       # package doc services/order/cmd/worker/main.go). exec-проба тоже
       # не вариант: итоговый образ — distroless/static (см.
-      # deploy/docker/Dockerfile.order-worker), внутри нет ни шелла, ни
+      # deploy/docker/order-worker.Dockerfile), внутри нет ни шелла, ни
       # pgrep/ps, чем можно было бы проверить "процесс жив изнутри".
       #
       # ЧЕМ ЭТО КОМПЕНСИРУЕТСЯ: Kubernetes и без явной liveness-пробы

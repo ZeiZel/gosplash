@@ -1,4 +1,4 @@
-# MinIO для kind — зеркалирует deploy/compose/minio.yml (тот же образ и
+# MinIO для kind — зеркалирует deploy/compose/docker-compose.minio.yml (тот же образ и
 # креды gosplash/gosplash). Простой манифест, не bitnami/minio-tenant-
 # оператор: нужен ОДИН S3-совместимый бакет-сервер без erasure coding и
 # multi-node distributed mode — учебная нагрузка (несколько загрузок за
@@ -6,13 +6,13 @@
 # существует.
 #
 # НЕОЧЕВИДНОЕ РЕШЕНИЕ: образы — quay.io/minio/{minio,mc}, А НЕ
-# docker.io/minio/{minio,mc}, как в deploy/compose/minio.yml. Проверено
+# docker.io/minio/{minio,mc}, как в deploy/compose/docker-compose.minio.yml. Проверено
 # при первом `make kind-up` на этой машине: docker.io/minio/minio и
 # docker.io/minio/mc с 2024 года недоступны анонимным docker pull
 # ("pull access denied... repository does not exist") — MinIO ограничил
 # публичный доступ к Docker Hub после смены лицензии, а зеркало на
 # quay.io (то же самое содержимое, тот же тег latest) осталось открытым.
-# Это, судя по всему, ЛОМАЕТ и docker-compose (deploy/compose/minio.yml
+# Это, судя по всему, ЛОМАЕТ и docker-compose (deploy/compose/docker-compose.minio.yml
 # использует те же docker.io-образы) — не в зоне ответственности этой
 # задачи, но стоит сообщить интегратору отдельно.
 apiVersion: v1
@@ -135,7 +135,7 @@ spec:
       port: 9001
       targetPort: 9001
 ---
-# Job — те же три команды mc, что и minio-init в deploy/compose/minio.yml:
+# Job — те же три команды mc, что и minio-init в deploy/compose/docker-compose.minio.yml:
 # создать оба бакета и открыть thumbnails на анонимное чтение.
 apiVersion: batch/v1
 kind: Job

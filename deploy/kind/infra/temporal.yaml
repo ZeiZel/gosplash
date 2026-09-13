@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Temporal для kind — зеркалирует deploy/compose/temporal.yml (pg-temporal +
+# Temporal для kind — зеркалирует deploy/compose/docker-compose.temporal.yml (pg-temporal +
 # temporalio/auto-setup + temporal-ui). Не в списке, явно перечисленном
 # в задании, но БЕЗ него order и order-worker не смогут даже стартовать:
 # sdkclient.Dial в обоих cmd/order/main.go и cmd/worker/main.go — фатальная

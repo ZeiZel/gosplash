@@ -1,7 +1,7 @@
 # Redis для kind — один инстанс на весь стенд, зеркалирует
-# deploy/compose/redis.yml (тот же образ и политика вытеснения). Простой
+# deploy/compose/docker-compose.redis.yml (тот же образ и политика вытеснения). Простой
 # манифест: Redis здесь ТОЛЬКО кэш/лок/rate-limit (см. комментарий в
-# deploy/compose/redis.yml — "потеря данных не страшна"), поэтому Sentinel/
+# deploy/compose/docker-compose.redis.yml — "потеря данных не страшна"), поэтому Sentinel/
 # Redis Operator ради HA не оправданы для одноразового стенда.
 #
 # ── СОЗНАТЕЛЬНО БЕЗ PersistentVolumeClaim (проверено на факте) ─────────────

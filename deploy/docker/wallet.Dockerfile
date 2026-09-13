@@ -6,30 +6,16 @@
 # :8103 HTTP служебный (/healthz, /readyz), :8204 служебный (/metrics,
 # /debug/pprof).
 #
-# Стратегия сборки монорепы разобрана в deploy/docker/Dockerfile.media.
+# Централизованная сборка (один `go build` в ./build снаружи, а не
+# builder-стадия в образе) и выбор distroless вместо alpine разобраны
+# подробно в deploy/docker/media.Dockerfile.
 # ─────────────────────────────────────────────────────────────────────────────
-
-FROM golang:1.27 AS builder
-WORKDIR /src
-
-COPY go.mod go.sum ./
-COPY pkg/ ./pkg/
-COPY gen/ ./gen/
-COPY services/wallet/ ./services/wallet/
-
-WORKDIR /src/services/wallet
-RUN go mod edit \
-      -require=gosplash@v0.0.0-00010101000000-000000000000 \
-      -replace=gosplash=../../
-
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/wallet ./cmd/wallet
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/wallet /usr/local/bin/wallet
+# Бинарник уже собран под linux/$(ARCH) снаружи — см. `make build-linux`
+# в корневом Makefile и разбор цены в deploy/docker/media.Dockerfile.
+COPY build/wallet /usr/local/bin/wallet
 
 USER nonroot:nonroot
 

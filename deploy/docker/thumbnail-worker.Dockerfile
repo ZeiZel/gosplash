@@ -8,30 +8,16 @@
 # Service) — поэтому у этого сервиса, как и у order-worker, k8s-объекта
 # Service не заводится: наружу и другим подам ходить сюда незачем.
 #
-# Стратегия сборки монорепы разобрана в deploy/docker/Dockerfile.media.
+# Централизованная сборка (один `go build` в ./build снаружи, а не
+# builder-стадия в образе) и выбор distroless вместо alpine разобраны
+# подробно в deploy/docker/media.Dockerfile.
 # ─────────────────────────────────────────────────────────────────────────────
-
-FROM golang:1.27 AS builder
-WORKDIR /src
-
-COPY go.mod go.sum ./
-COPY pkg/ ./pkg/
-COPY gen/ ./gen/
-COPY services/thumbnail-worker/ ./services/thumbnail-worker/
-
-WORKDIR /src/services/thumbnail-worker
-RUN go mod edit \
-      -require=gosplash@v0.0.0-00010101000000-000000000000 \
-      -replace=gosplash=../../
-
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/thumbnail-worker ./cmd/thumbnail-worker
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/thumbnail-worker /usr/local/bin/thumbnail-worker
+# Бинарник уже собран под linux/$(ARCH) снаружи — см. `make build-linux`
+# в корневом Makefile и разбор цены в deploy/docker/media.Dockerfile.
+COPY build/thumbnail-worker /usr/local/bin/thumbnail-worker
 
 USER nonroot:nonroot
 

@@ -12,30 +12,16 @@
 # seed-утилита предназначена для разового ручного запуска (`go run` во время
 # разработки), а не для деплоя как часть Deployment.
 #
-# Стратегия сборки монорепы разобрана в deploy/docker/Dockerfile.media.
+# Централизованная сборка (один `go build` в ./build снаружи, а не
+# builder-стадия в образе) и выбор distroless вместо alpine разобраны
+# подробно в deploy/docker/media.Dockerfile.
 # ─────────────────────────────────────────────────────────────────────────────
-
-FROM golang:1.27 AS builder
-WORKDIR /src
-
-COPY go.mod go.sum ./
-COPY pkg/ ./pkg/
-COPY gen/ ./gen/
-COPY services/analytics/ ./services/analytics/
-
-WORKDIR /src/services/analytics
-RUN go mod edit \
-      -require=gosplash@v0.0.0-00010101000000-000000000000 \
-      -replace=gosplash=../../
-
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/analytics ./cmd/analytics
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/analytics /usr/local/bin/analytics
+# Бинарник уже собран под linux/$(ARCH) снаружи — см. `make build-linux`
+# в корневом Makefile и разбор цены в deploy/docker/media.Dockerfile.
+COPY build/analytics /usr/local/bin/analytics
 
 USER nonroot:nonroot
 

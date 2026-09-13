@@ -8,7 +8,7 @@
 #
 # Директива include появилась в Docker Compose 2.20. Относительные пути
 # внутри включённого файла резолвятся от его собственной директории,
-# поэтому ../nginx/... в gateway.yml указывает туда, куда надо.
+# поэтому ../nginx/... в docker-compose.gateway.yml указывает туда, куда надо.
 #
 # Все контейнеры оказываются в одной сети проекта (gosplash_default) и видят
 # друг друга по имени сервиса: kafka:9092, redis:6379, minio:9000.
@@ -18,12 +18,12 @@
 name: gosplash
 
 include:
-  - postgres.yml       # pg-shard-0/1, pg-catalog (+реплика), pg-wallet, pg-order
-  - kafka.yml          # kafka (KRaft), kafka-init, kafka-ui
-  - redis.yml          # redis, redisinsight
-  - minio.yml          # minio, minio-init
-  - temporal.yml       # pg-temporal, temporal, temporal-ui
-  - clickhouse.yml     # clickhouse                          (фаза 4)
-  - elasticsearch.yml  # elasticsearch                       (фаза 5)
-  - observability.yml  # otel-collector, tempo, loki, promtail, prometheus, grafana
-  - gateway.yml        # nginx
+  - docker-compose.postgres.yml       # pg-shard-0/1, pg-catalog (+реплика), pg-wallet, pg-order
+  - docker-compose.kafka.yml          # kafka (KRaft), kafka-init, kafka-ui
+  - docker-compose.redis.yml          # redis, redisinsight
+  - docker-compose.minio.yml          # minio, minio-init
+  - docker-compose.temporal.yml       # pg-temporal, temporal, temporal-ui
+  - docker-compose.clickhouse.yml     # clickhouse                          (фаза 4)
+  - docker-compose.elasticsearch.yml  # elasticsearch                       (фаза 5)
+  - docker-compose.observability.yml  # otel-collector, tempo, loki, promtail, prometheus, grafana
+  - docker-compose.gateway.yml        # nginx

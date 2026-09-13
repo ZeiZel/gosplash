@@ -1,4 +1,4 @@
-# ClickHouse для kind — зеркалирует deploy/compose/clickhouse.yml. Не входит
+# ClickHouse для kind — зеркалирует deploy/compose/docker-compose.clickhouse.yml. Не входит
 # в список, явно перечисленный в задании (Postgres/Kafka/Redis/MinIO), но
 # без него analytics-service никогда не станет ready (health.Register
 # "clickhouse", см. cmd/analytics/main.go) — деплоить сервис без его

@@ -1,4 +1,4 @@
-# Elasticsearch для kind — зеркалирует deploy/compose/elasticsearch.yml
+# Elasticsearch для kind — зеркалирует deploy/compose/docker-compose.elasticsearch.yml
 # (single-node, security выключена — то же самое "только для локального
 # стенда" предупреждение, см. комментарий в оригинале и в
 # deploy/helm/search/values.yaml, раздел "что менять для прода"). Как и
@@ -87,7 +87,7 @@ spec:
             # /_cluster/health отвечает 200 даже при status=red (это
             # обычный HTTP-эндпоинт, а не readinessProbe API). Честная
             # проверка status потребовала бы exec с curl+grep, как в
-            # healthcheck deploy/compose/elasticsearch.yml — для
+            # healthcheck deploy/compose/docker-compose.elasticsearch.yml — для
             # одноразового демо-стенда "порт отвечает" достаточный
             # опережающий сигнал: красный кластер всё равно будет виден
             # по ошибке health.Register("elasticsearch", ...) в /readyz

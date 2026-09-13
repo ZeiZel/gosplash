@@ -7,30 +7,16 @@
 # для HTTP не заводится, только headless для gRPC (см.
 # deploy/helm/search/values.yaml).
 #
-# Стратегия сборки монорепы разобрана в deploy/docker/Dockerfile.media.
+# Централизованная сборка (один `go build` в ./build снаружи, а не
+# builder-стадия в образе) и выбор distroless вместо alpine разобраны
+# подробно в deploy/docker/media.Dockerfile.
 # ─────────────────────────────────────────────────────────────────────────────
-
-FROM golang:1.27 AS builder
-WORKDIR /src
-
-COPY go.mod go.sum ./
-COPY pkg/ ./pkg/
-COPY gen/ ./gen/
-COPY services/search/ ./services/search/
-
-WORKDIR /src/services/search
-RUN go mod edit \
-      -require=gosplash@v0.0.0-00010101000000-000000000000 \
-      -replace=gosplash=../../
-
-RUN --mount=type=cache,target=/root/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/search ./cmd/search
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/search /usr/local/bin/search
+# Бинарник уже собран под linux/$(ARCH) снаружи — см. `make build-linux`
+# в корневом Makefile и разбор цены в deploy/docker/media.Dockerfile.
+COPY build/search /usr/local/bin/search
 
 USER nonroot:nonroot
 

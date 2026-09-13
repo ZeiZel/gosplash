@@ -37,7 +37,7 @@ serviceAccount:
 # ── Безопасность пода ────────────────────────────────────────────────────────
 # Требование задания «непривилегированный пользователь, никакого root»
 # продублировано здесь НАМЕРЕННО, хотя базовый образ (distroless:nonroot,
-# см. deploy/docker/Dockerfile.media) уже запускается от nonroot: если кто-то
+# см. deploy/docker/media.Dockerfile) уже запускается от nonroot: если кто-то
 # в будущем поменяет базовый образ на обычный distroless (без :nonroot) или
 # на alpine, чарт всё равно не даст поду стартовать от root — runAsNonRoot
 # без явного runAsUser в контейнере привёл бы к ошибке запуска, а не к тихому
@@ -148,7 +148,7 @@ terminationGracePeriodSeconds: 65
 # что медленнее, чем просто "endpoint убран из списка").
 #
 # Экшен sleep (lifecycle.preStop.sleep.seconds), а не exec ["sleep","5"]:
-# итоговый образ — gcr.io/distroless/static-debian12 (см. Dockerfile.media),
+# итоговый образ — gcr.io/distroless/static-debian12 (см. media.Dockerfile),
 # в нём НЕТ ни шелла, ни бинарника /bin/sleep, exec-хук просто не найдёт,
 # что запускать. Нативный sleep-экшен (KEP-3960, GA с Kubernetes 1.29) не
 # требует ничего внутри контейнера — именно поэтому выбор distroless вместо

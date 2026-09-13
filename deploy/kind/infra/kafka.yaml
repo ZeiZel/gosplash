@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Kafka для kind — один брокер в режиме KRaft, тот же образ и та же схема
-# ролей, что и в deploy/compose/kafka.yml. Простой манифест, а не
+# ролей, что и в deploy/compose/docker-compose.kafka.yml. Простой манифест, а не
 # bitnami/kafka chart или Strimzi-оператор — по той же причине, что и
 # Postgres (см. deploy/kind/infra/postgres.yaml): один брокер без репликации
 # партиций не нуждается ни в чём из того, что даёт оператор (multi-broker
@@ -94,7 +94,7 @@ spec:
             - name: KAFKA_PROCESS_ROLES
               value: "broker,controller"
             # localhost, А НЕ Service "kafka" — НЕОЧЕВИДНОЕ РЕШЕНИЕ, отличающее
-            # этот файл от deploy/compose/kafka.yml (там "kafka:9093" работает,
+            # этот файл от deploy/compose/docker-compose.kafka.yml (там "kafka:9093" работает,
             # потому что в docker-сети "kafka" резолвится прямо в IP того же
             # контейнера). В Kubernetes "kafka:9093" — это ClusterIP Service,
             # то есть отдельный слой DNAT (kube-proxy/iptables) МЕЖДУ подом
@@ -114,7 +114,7 @@ spec:
               value: "INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
             # Внутри кластера ничего снаружи не подключается — в отличие
             # от docker-compose, EXTERNAL-листенер здесь не нужен вообще,
-            # это единственное отличие от deploy/compose/kafka.yml.
+            # это единственное отличие от deploy/compose/docker-compose.kafka.yml.
             - name: KAFKA_ADVERTISED_LISTENERS
               value: "INTERNAL://kafka:9092"
             - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
@@ -197,7 +197,7 @@ spec:
 # брокера — лишняя работа и лишняя точка отказа при readiness-race). Job
 # запускается один раз в рамках `make kind-up` (см. mk/k8s.mk) ПОСЛЕ того,
 # как Service kafka уже отвечает, и завершается — тот же приём, что
-# kafka-init в deploy/compose/kafka.yml, перенесённый на Job вместо
+# kafka-init в deploy/compose/docker-compose.kafka.yml, перенесённый на Job вместо
 # "ещё одного контейнера в compose".
 apiVersion: batch/v1
 kind: Job
@@ -214,7 +214,7 @@ spec:
         - name: kafka-topics-init
           image: apache/kafka:4.0.0
           command: ["/bin/sh", "-c"]
-          # Список топиков и партиций — дословно deploy/compose/kafka.yml
+          # Список топиков и партиций — дословно deploy/compose/docker-compose.kafka.yml
           # (kafka-init), см. там подробные комментарии про конвенцию имён
           # (docs/adr/0003) и выбор числа партиций.
           args:

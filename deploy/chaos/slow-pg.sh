@@ -5,7 +5,7 @@
 # ЧТО ЛОМАЕМ И ЧЕМ
 #   `tc qdisc add ... netem delay` меняет ПЛАНИРОВЩИК ПАКЕТОВ сетевого
 #   интерфейса и требует capability NET_ADMIN у процесса, который его
-#   вызывает. Ни один Postgres-сервис в deploy/compose/postgres.yml не
+#   вызывает. Ни один Postgres-сервис в deploy/compose/docker-compose.postgres.yml не
 #   объявляет `cap_add: [NET_ADMIN]` (сознательно: он не нужен для работы
 #   Postgres, и добавлять привилегию контейнеру ради одного chaos-скрипта —
 #   расширять поверхность атаки постоянно ради теста, который запускается
@@ -18,7 +18,7 @@
 # СЕТЕВОЙ SIDECAR, а не pg-catalog, нуждается в NET_ADMIN, потому что
 # capability проверяется у процесса, который делает syscall, а не у
 # владельца netns. Это значит: cap_add НЕ нужно дописывать в
-# deploy/compose/postgres.yml (файл вне зоны ответственности этого скрипта
+# deploy/compose/docker-compose.postgres.yml (файл вне зоны ответственности этого скрипта
 # и вообще не должен меняться ради теста) — весь chaos создаётся и
 # разбирается СНАРУЖИ, обычным `docker run --rm`.
 #

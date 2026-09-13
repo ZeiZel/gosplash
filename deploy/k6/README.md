@@ -45,7 +45,7 @@ make k6-order                       # place_order.js
 Цели в `mk/load.mk` дергают `docker run --rm -i grafana/k6:latest run` с
 примонтированным `deploy/k6` и `BASE_URL=http://host.docker.internal:58080` —
 тем же приёмом, каким `deploy/nginx/gateway.conf` достаёт до сервисов на
-хосте (см. комментарий в `deploy/compose/gateway.yml`). `--add-host` в
+хосте (см. комментарий в `deploy/compose/docker-compose.gateway.yml`). `--add-host` в
 команде нужен, чтобы это работало не только на Docker Desktop
 (macOS/Windows), но и на Linux, где `host.docker.internal` без него не
 резолвится.

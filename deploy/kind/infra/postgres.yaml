@@ -1,6 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # PostgreSQL для kind — 6 независимых серверов, зеркалирующих
-# deploy/compose/postgres.yml (те же имена, тот же образ, те же
+# deploy/compose/docker-compose.postgres.yml (те же имена, тот же образ, те же
 # gosplash/gosplash учебные креды — см. итоговый список "что менять для
 # прода" в deploy/helm/media/values.yaml).
 #
@@ -157,7 +157,7 @@ spec:
             - configMapRef:
                 name: postgres-env
           # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
-          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # репликации, см. deploy/compose/docker-compose.postgres.yml) — на остальных это
           # просто лишняя запись в WAL без потребителя, поэтому параметр
           # не расставлен на всех шести одинаково.
           ports:
@@ -234,7 +234,7 @@ spec:
             - configMapRef:
                 name: postgres-env
           # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
-          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # репликации, см. deploy/compose/docker-compose.postgres.yml) — на остальных это
           # просто лишняя запись в WAL без потребителя, поэтому параметр
           # не расставлен на всех шести одинаково.
           ports:
@@ -311,7 +311,7 @@ spec:
             - configMapRef:
                 name: postgres-env
           # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
-          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # репликации, см. deploy/compose/docker-compose.postgres.yml) — на остальных это
           # просто лишняя запись в WAL без потребителя, поэтому параметр
           # не расставлен на всех шести одинаково.
           args: ["-c", "wal_level=logical"]
@@ -389,7 +389,7 @@ spec:
             - configMapRef:
                 name: postgres-env
           # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
-          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # репликации, см. deploy/compose/docker-compose.postgres.yml) — на остальных это
           # просто лишняя запись в WAL без потребителя, поэтому параметр
           # не расставлен на всех шести одинаково.
           ports:
@@ -466,7 +466,7 @@ spec:
             - configMapRef:
                 name: postgres-env
           # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
-          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # репликации, см. deploy/compose/docker-compose.postgres.yml) — на остальных это
           # просто лишняя запись в WAL без потребителя, поэтому параметр
           # не расставлен на всех шести одинаково.
           ports:
@@ -543,7 +543,7 @@ spec:
             - configMapRef:
                 name: postgres-env
           # wal_level=logical нужен ТОЛЬКО pg-catalog (издатель логической
-          # репликации, см. docs/compose/postgres.yml) — на остальных это
+          # репликации, см. deploy/compose/docker-compose.postgres.yml) — на остальных это
           # просто лишняя запись в WAL без потребителя, поэтому параметр
           # не расставлен на всех шести одинаково.
           ports:

@@ -60,7 +60,7 @@ docker-контейнеры (см. `deploy/nginx/gateway.conf`: gateway дост
 Подробное обоснование — в шапке самого файла (`deploy/chaos/slow-pg.sh`):
 коротко, `tc netem` применяется из ОТДЕЛЬНОГО sidecar-контейнера, подключённого
 к сетевому namespace цели (`--network container:<target>`), а NET_ADMIN нужен
-именно этому sidecar, а не самой базе — значит, `deploy/compose/postgres.yml`
+именно этому sidecar, а не самой базе — значит, `deploy/compose/docker-compose.postgres.yml`
 (вне зоны ответственности этой задачи и не должен меняться ради теста)
 трогать не пришлось. Это реально проверено на этой машине: `tc qdisc add`
 из `nicolaka/netshoot`, подключённого к netns контейнера `pg-catalog`, снял

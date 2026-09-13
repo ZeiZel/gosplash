@@ -89,7 +89,7 @@ config:
 
   # elasticsearch — Service из deploy/kind/infra/elasticsearch.yaml.
   # security выключена (xpack.security.enabled=false, см.
-  # deploy/compose/elasticsearch.yml) — учебный стенд без аутентификации,
+  # deploy/compose/docker-compose.elasticsearch.yml) — учебный стенд без аутентификации,
   # поэтому здесь нет ES_PASSWORD и, соответственно, нет secrets ниже:
   # заводить пустой Secret ради формы было бы имитацией безопасности,
   # а не безопасностью (см. отчёт по фазе 6 — прод обязан включить
