@@ -113,6 +113,35 @@ jobs:
             echo "::notice::buf breaking пропущен — origin/main совпадает с HEAD (нет предыдущего коммита для сравнения)"
           fi
 
+      # Сгенерированный код (gen/go) КОММИТИТСЯ в репозиторий: иначе `go build`
+      # потребовал бы установленных buf и плагинов у каждого, кто просто
+      # склонировал проект, а CI — шага генерации перед сборкой.
+      #
+      # Риск у такого решения ровно один: файлы разъедутся с .proto, если
+      # кто-то поправил контракт и забыл `make proto`. Лечится это не
+      # удалением gen/ из гита, а проверкой здесь — перегенерировать и
+      # упасть, если появился diff. Тогда расхождение видно в пулл-реквесте,
+      # а не через неделю в рантайме.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - name: Плагины protoc
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+      - name: gen/go не разъехался с proto/
+        run: |
+          cd proto && buf generate && cd ..
+          if ! git diff --quiet -- gen/; then
+            echo "::error::gen/go отличается от того, что даёт buf generate — выполни 'make proto' и закоммить результат"
+            git diff --stat -- gen/
+            exit 1
+          fi
+          echo "gen/go соответствует контрактам"
+
   # ───────────────────────────────────────────────────────────────────────
   # lint — часть 2/3: golangci-lint по каждому модулю отдельно. У каждого
   # сервиса свой go.mod (см. docs/adr/0001-*) и свой набор транзитивных
@@ -278,9 +307,19 @@ jobs:
         run: go test ./... -tags=integration -count=1 -timeout=15m
 
   # ───────────────────────────────────────────────────────────────────────
-  # build — все бинарники сервисов и утилит. Переиспользует `make build`
-  # (BINARIES уже перечислены в корневом Makefile) вместо того, чтобы
-  # заново собирать список целей сборки здесь.
+  # build — все бинарники сервисов и утилит, а дальше — сами Docker-образы.
+  # Переиспользует `make build`/`make build-linux` (BINARIES уже перечислены
+  # в корневом Makefile) вместо того, чтобы заново собирать список целей
+  # сборки здесь.
+  #
+  # Порядок ЖЁСТКО важен и намеренно двухшаговый: сначала `make build-linux`
+  # кладёт готовые linux-бинарники в ./build, и только ПОТОМ `docker build`
+  # (deploy/docker/*.Dockerfile каждый раз копируют файл из ./build, а не
+  # собирают его сами — разбор цены и причины в deploy/docker/media.Dockerfile).
+  # Обратный порядок или пропуск build-linux даст на `docker build` честную
+  # ошибку "file not found" — это ровно то, что должно проверяться в CI,
+  # поэтому мы не притворяемся, что образ самодостаточен, и не прячем шаг
+  # build-linux внутрь Dockerfile ради красивой единственной команды.
   # ───────────────────────────────────────────────────────────────────────
   build:
     name: build
@@ -294,3 +333,15 @@ jobs:
 
       - name: make build
         run: make build
+
+      - name: make build-linux
+        run: make build-linux
+
+      - name: docker build (deploy/docker/*.Dockerfile)
+        run: |
+          set -euo pipefail
+          for f in deploy/docker/*.Dockerfile; do
+            img="$(basename "$f" .Dockerfile)"
+            printf '\n== %s ==\n' "$img"
+            docker build -f "$f" -t "gosplash/$img:ci" .
+          done
