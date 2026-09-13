@@ -1,0 +1,147 @@
+// Package clickhouse — адаптер к ClickHouse: батчинг вставок со стороны
+// Kafka-консьюмера (batch.go), сама запись строк (writer.go) и чтение
+// сводок для gRPC (repository.go).
+//
+// GORM здесь сознательно не используется (см. корневой README задачи и
+// docs/adr/0016-*): у ClickHouse нет ни первичного ключа в смысле GORM
+// (сравни с разреженным индексом ORDER BY, см. миграции), ни UPDATE, ни
+// транзакций — весь набор абстракций, вокруг которого построен GORM, здесь
+// просто не существует. Писать вокруг него прослойку, которая притворяется,
+// что INSERT ClickHouse — это db.Create(&row), значило бы прятать разницу,
+// которую как раз важно видеть на каждой строке SQL.
+package clickhouse
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// PATTERN: batch-before-commit — синхронный батчинг с ожиданием реального
+// результата вставки, а НЕ асинхронный буфер с непроверяемой судьбой
+// (сравни с services/catalog/internal/adapters/kafka/view_batcher.go).
+//
+// Разница принципиальна и вот почему. ViewBatcher каталога живёт МЕЖДУ
+// прикладным кодом и Kafka: если буфер потерян при падении процесса,
+// событие туда просто никогда не попадало — Kafka о нём ничего не знает,
+// это осознанная потеря части сырых данных на входе. Writer[T] живёт МЕЖДУ
+// Kafka и ClickHouse — то есть на ПОСЛЕДНЕМ шаге. Если бы Add() возвращал
+// nil сразу после постановки в буфер (как Enqueue у ViewBatcher), консьюмер
+// kafkax.Consumer (pkg/kafkax, трогать нельзя) закоммитил бы offset ДО того,
+// как строка реально легла в ClickHouse. Упади процесс в этот момент —
+// Kafka никогда не пришлёт это сообщение снова (offset уже продвинут),
+// и строка исчезает из отчёта молча и навсегда: дыру нечем закрыть, потому
+// что источника события в Kafka больше нет.
+//
+// Add() поэтому БЛОКИРУЕТ вызывающего до тех пор, пока не завершится
+// batch-вставка, частью которой стала ЭТА строка, и возвращает её результат.
+// offset коммитится (это делает сам kafkax.Consumer) только после успешного
+// возврата — то есть только когда строка уже физически в ClickHouse.
+//
+// Цена (раздел "чем платим", как и положено PATTERN-у): если процесс упадёт
+// МЕЖДУ успешной вставкой партии и тем, как Add() успеет вернуть nil ВСЕМ
+// её строкам, при перезапуске часть сообщений придёт из Kafka повторно
+// (offset для них ещё не закоммичен) и будет вставлена ЕЩЁ РАЗ. Это
+// ДУБЛИКАТ, а не потеря — ClickHouse не проверяет уникальность (см. README
+// сервиса, раздел про разреженный индекс), и вставит его молча второй
+// строкой. Дубликат — по крайней мере видимая, чинимая позже проблема
+// (ReplacingMergeTree, дедупликация в запросе); дыра в отчёте — невидимая
+// и нечинимая. Между "иногда дважды" и "иногда никогда" здесь осознанно
+// выбрано первое.
+type Writer[T any] struct {
+	insert   func(ctx context.Context, rows []T) error
+	maxBatch int
+	maxWait  time.Duration
+
+	mu      sync.Mutex
+	pending []T
+	waiters []chan error
+	timer   *time.Timer
+}
+
+// NewWriter создаёт батчер. insert вызывается ровно один раз на пачку —
+// это единственное место, которое ходит в ClickHouse.
+func NewWriter[T any](maxBatch int, maxWait time.Duration, insert func(ctx context.Context, rows []T) error) *Writer[T] {
+	if maxBatch <= 0 {
+		maxBatch = 1000
+	}
+	if maxWait <= 0 {
+		maxWait = time.Second
+	}
+	return &Writer[T]{insert: insert, maxBatch: maxBatch, maxWait: maxWait}
+}
+
+// Add кладёт row в текущую пачку и ждёт её отправки.
+//
+// Первая строка новой пачки заводит таймер maxWait — иначе редкий поток
+// событий (например, purchases — их на порядки меньше, чем просмотров)
+// мог бы никогда не набрать maxBatch строк и висеть в памяти бесконечно.
+// Как только пачка набирает maxBatch строк, флаш происходит немедленно,
+// не дожидаясь таймера.
+func (w *Writer[T]) Add(ctx context.Context, row T) error {
+	w.mu.Lock()
+	w.pending = append(w.pending, row)
+	ch := make(chan error, 1)
+	w.waiters = append(w.waiters, ch)
+
+	full := len(w.pending) >= w.maxBatch
+	if len(w.pending) == 1 {
+		w.timer = time.AfterFunc(w.maxWait, w.flush)
+	}
+	w.mu.Unlock()
+
+	if full {
+		w.flush()
+	}
+
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		// Строка уже в буфере и рано или поздно уедет в ClickHouse вместе
+		// с остальной пачкой (флаш не отменяется отменой ОДНОГО вызывающего
+		// контекста) — просто ЭТОТ вызов Add не станет ждать результат.
+		// Возвращаем ctx.Err(), чтобы kafkax классифицировал его как
+		// retryable по умолчанию (docs/STYLE.md: неклассифицированная
+		// ошибка — retryable) и попробовал обработать сообщение снова.
+		return ctx.Err()
+	}
+}
+
+// flush отправляет накопленную пачку. Может быть вызван дважды почти
+// одновременно (по таймеру и по заполнению) — это безопасно: второй вызов
+// застанет w.pending уже пустым и ничего не сделает.
+func (w *Writer[T]) flush() {
+	w.mu.Lock()
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	rows := w.pending
+	waiters := w.waiters
+	w.pending = nil
+	w.waiters = nil
+	w.mu.Unlock()
+
+	if len(rows) == 0 {
+		return
+	}
+
+	// Собственный контекст, а не контекст первого Add: тот мог уже
+	// отмениться (см. ветку ctx.Done() выше), а вставка пачки — общая
+	// операция для ВСЕХ строк в ней, и одна отменённая горутина не должна
+	// обрывать вставку данных остальных.
+	ctx, cancel := context.WithTimeout(context.Background(), insertTimeout)
+	defer cancel()
+
+	err := w.insert(ctx, rows)
+	for _, ch := range waiters {
+		ch <- err
+	}
+}
+
+// insertTimeout — бюджет на одну batch-вставку. Больше, чем обычный запрос:
+// вставка тысяч строк батчем — тяжёлая операция по сравнению с точечным
+// SELECT, и слишком короткий таймаут превратил бы редкие всплески задержки
+// ClickHouse в постоянные ретраи одной и той же пачки.
+const insertTimeout = 30 * time.Second
