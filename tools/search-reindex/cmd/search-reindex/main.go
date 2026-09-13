@@ -31,7 +31,14 @@ import (
 	"gosplash/search-reindex/internal/reindex"
 )
 
-func main() {
+// run делает всю работу и ВОЗВРАЩАЕТ ошибку, а не завершает процесс сам.
+//
+// Разница не косметическая: при os.Exit/log.Fatal прямо из main отложенные
+// вызовы (defer) НЕ выполняются — соединения остаются незакрытыми, буферы
+// несброшенными. Именно это и ловит линтер (gocritic exitAfterDefer).
+// Когда выход происходит обычным return, все defer успевают отработать,
+// а os.Exit вызывается уже в main, когда возвращаться некуда.
+func run() error {
 	var (
 		catalogAddr = flag.String("catalog", "localhost:9102", "адрес gRPC catalog.v1.CatalogService")
 		addrsFlag   = flag.String("addrs", "http://localhost:59200", "адреса узлов Elasticsearch через запятую")
@@ -53,15 +60,13 @@ func main() {
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
-		slog.Error("search-reindex: gRPC к catalog", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search-reindex: gRPC к catalog: %w", err)
 	}
 	defer catalogConn.Close()
 
 	esAdapter, err := reindex.NewESAdapter(splitAddrs(*addrsFlag))
 	if err != nil {
-		slog.Error("search-reindex: elasticsearch client", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search-reindex: elasticsearch client: %w", err)
 	}
 
 	catalogAdapter := reindex.NewCatalogAdapter(catalogv1.NewCatalogServiceClient(catalogConn))
@@ -74,15 +79,15 @@ func main() {
 		DryRun:    *dryRun,
 	})
 	if err != nil {
-		slog.Error("search-reindex: переиндексация прервана", "error", err,
+		slog.Error("search-reindex: переиндексация прервана",
 			"old_index", result.OldIndex, "new_index", result.NewIndex, "docs_indexed", result.DocsIndexed)
-		os.Exit(1)
+		return fmt.Errorf("переиндексация: %w", err)
 	}
 
 	if result.DryRun {
 		fmt.Printf("dry-run: перенос затронул бы %d документов (%s → %s), ничего не изменено\n",
 			result.DocsIndexed, orNone(result.OldIndex), result.NewIndex)
-		return
+		return nil
 	}
 
 	fmt.Printf("готово: %d документов перенесено в %s, alias %q переключён (было: %s)\n",
@@ -94,6 +99,7 @@ func main() {
 			fmt.Printf("старый индекс %s сохранён (-keep-old)\n", result.OldIndex)
 		}
 	}
+	return nil
 }
 
 func orNone(s string) string {
@@ -112,4 +118,14 @@ func splitAddrs(v string) []string {
 		}
 	}
 	return result
+}
+
+// main намеренно состоит из трёх строк: это единственное место программы,
+// которому позволено завершать процесс. К этому моменту run уже вернулась,
+// то есть все её defer отработали.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("остановлен с ошибкой", "error", err)
+		os.Exit(1)
+	}
 }

@@ -35,7 +35,7 @@ type testServiceEchoStreamServer struct {
 }
 
 func (x *testServiceEchoStreamServer) Send(m *wrapperspb.StringValue) error {
-	return x.ServerStream.SendMsg(m)
+	return x.SendMsg(m)
 }
 
 // testServiceServer — то, что генератор назвал бы TestServiceServer.

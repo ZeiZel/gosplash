@@ -14,9 +14,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	"google.golang.org/grpc"
@@ -27,21 +29,28 @@ import (
 	mediav1 "gosplash/gen/go/gosplash/media/v1"
 )
 
-func main() {
+// run делает всю работу и ВОЗВРАЩАЕТ ошибку, а не завершает процесс сам.
+//
+// Разница не косметическая: при os.Exit/log.Fatal прямо из main отложенные
+// вызовы (defer) НЕ выполняются — соединения остаются незакрытыми, буферы
+// несброшенными. Именно это и ловит линтер (gocritic exitAfterDefer).
+// Когда выход происходит обычным return, все defer успевают отработать,
+// а os.Exit вызывается уже в main, когда возвращаться некуда.
+func run() error {
 	target := flag.String("target", "localhost:9101", "адрес gRPC media")
 	id := flag.String("id", "", "id фото")
 	userID := flag.Int64("user", 0, "id пользователя — он же ключ шардирования")
 	flag.Parse()
 
 	if *id == "" || *userID == 0 {
-		log.Fatal("нужны -id и -user")
+		return errors.New("нужны -id и -user")
 	}
 
 	// Соединение ленивое: реальный коннект произойдёт при первом вызове,
 	// и клиент сам переподключится, если сервис перезапустят.
 	conn, err := grpc.NewClient(*target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("подключение: %v", err)
+		return fmt.Errorf("подключение: %w", err)
 	}
 	defer conn.Close()
 
@@ -58,14 +67,25 @@ func main() {
 		// NotFound и InvalidArgument повторять бессмысленно,
 		// Unavailable и DeadlineExceeded — наоборот, стоит.
 		st, _ := status.FromError(err)
-		log.Fatalf("GetPhoto: %s: %s", st.Code(), st.Message())
+		return fmt.Errorf("GetPhoto: %s: %s", st.Code(), st.Message())
 	}
 
 	// protojson печатает protobuf в JSON по правилам самого протокола
 	// (camelCase, enum'ы строками), а не через encoding/json.
 	out, err := protojson.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(resp)
 	if err != nil {
-		log.Fatalf("вывод: %v", err)
+		return fmt.Errorf("вывод: %w", err)
 	}
 	fmt.Println(string(out))
+	return nil
+}
+
+// main намеренно состоит из трёх строк: это единственное место программы,
+// которому позволено завершать процесс. К этому моменту run уже вернулась,
+// то есть все её defer отработали.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("остановлен с ошибкой", "error", err)
+		os.Exit(1)
+	}
 }

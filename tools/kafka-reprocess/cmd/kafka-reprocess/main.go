@@ -60,7 +60,17 @@ const reprocessGroup = "kafka-reprocess"
 // признак временной задержки брокера.
 const idleTimeout = 5 * time.Second
 
-func main() {
+// run делает всю работу и ВОЗВРАЩАЕТ ошибку, а не завершает процесс сам.
+//
+// Разница не косметическая: при os.Exit/log.Fatal прямо из main отложенные
+// вызовы (defer) НЕ выполняются — соединения остаются незакрытыми, буферы
+// несброшенными. Именно это и ловит линтер (gocritic exitAfterDefer).
+// Когда выход происходит обычным return, все defer успевают отработать,
+// а os.Exit вызывается уже в main, когда возвращаться некуда.
+// runCLI, а не run: имя run в этом файле уже занято функцией, которая
+// выполняет саму переливку сообщений. Внешняя обёртка отвечает за флаги,
+// соединения и их закрытие.
+func runCLI() error {
 	topic := flag.String("topic", "", "исходный топик, БЕЗ суффикса .dlq (обязателен)")
 	limit := flag.Int("limit", 0, "сколько сообщений перелить за запуск (0 = все, что накопилось к моменту запуска)")
 	dryRun := flag.Bool("dry-run", false, "только показать, что было бы перелито; ничего не отправлять и не коммитить")
@@ -90,7 +100,7 @@ func main() {
 		kgo.DisableAutoCommit(),
 	)
 	if err != nil {
-		log.Fatalf("kafka-reprocess: consumer: %v", err)
+		return fmt.Errorf("kafka-reprocess: consumer: %w", err)
 	}
 	defer consumer.Close()
 
@@ -106,14 +116,14 @@ func main() {
 			kgo.RecordRetries(5),
 		)
 		if err != nil {
-			log.Fatalf("kafka-reprocess: producer: %v", err)
+			return fmt.Errorf("kafka-reprocess: producer: %w", err)
 		}
 		defer producer.Close()
 	}
 
 	sent, err := run(context.Background(), consumer, producer, *topic, *limit, *dryRun)
 	if err != nil {
-		log.Fatalf("kafka-reprocess: %v", err)
+		return fmt.Errorf("kafka-reprocess: %w", err)
 	}
 
 	suffix := ""
@@ -121,6 +131,7 @@ func main() {
 		suffix = " (dry-run, ничего не отправлено и не закоммичено)"
 	}
 	log.Printf("kafka-reprocess: готово — %d сообщений из %s → %s%s", sent, dlqTopic, *topic, suffix)
+	return nil
 }
 
 // run — основной цикл: читает dlqTopic, пока не наберёт limit сообщений
@@ -144,13 +155,20 @@ func run(ctx context.Context, consumer, producer *kgo.Client, topic string, limi
 		}
 
 		stop := false
+		// EachRecord принимает func(*kgo.Record) без возврата, поэтому
+		// ошибку публикации приходится ВЫНОСИТЬ наружу переменной, а не
+		// возвращать из замыкания: обход останавливается флагом stop,
+		// а причина уезжает в loopErr и проверяется после обхода.
+		var loopErr error
 		fetches.EachRecord(func(record *kgo.Record) {
 			if stop || (limit > 0 && sent >= limit) {
 				stop = true
 				return
 			}
 			if err := reprocessOne(ctx, producer, topic, record, dryRun); err != nil {
-				log.Fatalf("kafka-reprocess: produce в %s: %v", topic, err)
+				loopErr = fmt.Errorf("kafka-reprocess: produce в %s: %w", topic, err)
+				stop = true
+				return
 			}
 			sent++
 			if !dryRun {
@@ -159,6 +177,9 @@ func run(ctx context.Context, consumer, producer *kgo.Client, topic string, limi
 				}
 			}
 		})
+		if loopErr != nil {
+			return sent, loopErr
+		}
 		if stop {
 			break
 		}
@@ -231,4 +252,14 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// main намеренно состоит из трёх строк: это единственное место программы,
+// которому позволено завершать процесс. К этому моменту run уже вернулась,
+// то есть все её defer отработали.
+func main() {
+	if err := runCLI(); err != nil {
+		slog.Error("остановлен с ошибкой", "error", err)
+		os.Exit(1)
+	}
 }

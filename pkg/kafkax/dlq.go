@@ -46,7 +46,12 @@ func originalTopic(record *kgo.Record) string {
 
 func originalPartition(record *kgo.Record) int32 {
 	if v, ok := headerValue(record.Headers, HeaderOriginalPartition); ok {
-		if n, err := strconv.Atoi(v); err == nil {
+		// ParseInt с явной разрядностью 32, а не Atoi с приведением: Atoi
+		// возвращает int (64 бита на наших платформах), и int32(n) молча
+		// обрезал бы значение, не влезающее в разрядность. Номер партиции
+		// столько не занимает никогда, но заголовок приходит ИЗВНЕ — его
+		// мог записать кто угодно, включая чужой инструмент.
+		if n, err := strconv.ParseInt(v, 10, 32); err == nil {
 			return int32(n)
 		}
 	}

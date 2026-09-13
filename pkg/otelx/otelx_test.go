@@ -64,7 +64,7 @@ func TestBuildResource_NeKonfliktuetPoSchemaURL(t *testing.T) {
 
 	attrs := map[string]string{}
 	for _, kv := range res.Attributes() {
-		attrs[string(kv.Key)] = kv.Value.Emit()
+		attrs[string(kv.Key)] = kv.Value.String()
 	}
 
 	assert.Equal(t, "test-service", attrs["service.name"],

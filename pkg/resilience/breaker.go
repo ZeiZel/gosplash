@@ -1,6 +1,7 @@
 package resilience
 
 import (
+	"errors"
 	"log/slog"
 	"time"
 
@@ -121,10 +122,14 @@ func (b *Breaker) Execute(op func() error) error {
 		return struct{}{}, op()
 	})
 
+	// Сравнение через errors.Is, а не ==: gobreaker возвращает свои сентинелы
+	// напрямую, но обёртка выше по стеку может завернуть их в %w, и тогда
+	// прямое сравнение молча перестало бы срабатывать — метрика показывала бы
+	// "failure" там, где на самом деле открыт предохранитель.
 	result := "success"
 	switch {
 	case err == nil:
-	case err == ErrBreakerOpen || err == ErrTooManyProbes: //nolint:errorlint // сравнение с сентинелами gobreaker, не обёрнутыми в %w
+	case errors.Is(err, ErrBreakerOpen), errors.Is(err, ErrTooManyProbes):
 		result = "open"
 	default:
 		result = "failure"
