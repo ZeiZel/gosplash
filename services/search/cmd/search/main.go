@@ -14,28 +14,27 @@
 // реальный индекс, и создаёт его с явным маппингом, если это самый первый
 // запуск (internal/adapters/es.Client.EnsureIndex). Смена схемы индекса
 // после этого — работа tools/search-reindex, не перезапуска сервиса.
+//
+// Файл разделён на bootstrap.App (чистая сборка зависимостей), run()
+// (конфиг/соединения/сигналы/graceful shutdown) и main() — см. STYLE.md
+// и internal/bootstrap про причину.
 package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"gosplash/pkg/config"
-	"gosplash/pkg/grpcx"
-	"gosplash/pkg/httpx"
 	"gosplash/pkg/kafkax"
 	"gosplash/pkg/otelx"
 
-	searchv1 "gosplash/gen/go/gosplash/search/v1"
-
 	"gosplash/services/search/internal/adapters/es"
-	searchgrpc "gosplash/services/search/internal/adapters/grpc"
-	"gosplash/services/search/internal/app"
+	"gosplash/services/search/internal/bootstrap"
 )
 
 const serviceName = "search"
@@ -51,7 +50,16 @@ const (
 	bulkFlushInterval = 300 * time.Millisecond
 )
 
-func main() {
+// otelShutdownTimeout — сколько ждём выгрузки последних трейсов/метрик
+// после того, как серверы уже остановлены.
+const otelShutdownTimeout = 5 * time.Second
+
+// run — жизненный цикл процесса: конфиг, соединения, запуск App, ожидание
+// сигнала, graceful shutdown. Возвращает ошибку вместо os.Exit — все defer
+// (закрытие консьюмеров, BulkIndexer, выгрузка otel) успевают отработать
+// независимо от того, на каком шаге всё пошло не так. Раньше os.Exit(1)
+// внутри main() обрывал их (gocritic: exitAfterDefer).
+func run() error {
 	conf := config.Load()
 	searchConf := conf.Search
 
@@ -67,135 +75,90 @@ func main() {
 		LogLevel:         conf.Observe.LogLevel,
 	})
 	if err != nil {
-		slog.Error("search: наблюдаемость", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search: наблюдаемость: %w", err)
 	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), otelShutdownTimeout)
+		defer cancel()
+		if err := shutdownOtel(shutdownCtx); err != nil {
+			slog.Error("search: otel shutdown", "error", err)
+		}
+	}()
 
 	if conf.GRPC.JWTSecret == "" {
 		slog.Warn("search: JWT_SECRET пуст — gRPC-аутентификация выключена, это нормально только для локальной разработки")
 	}
 
-	// ── Elasticsearch ──────────────────────────────────────────────────────
+	// ── Elasticsearch ────────────────────────────────────────────────────
 	esClient, err := es.New(searchConf.Addrs, searchConf.IndexAlias)
 	if err != nil {
-		slog.Error("search: elasticsearch client", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search: elasticsearch client: %w", err)
 	}
 	if err := esClient.EnsureIndex(ctx); err != nil {
 		// Не просто предупреждение: без индекса ни поиск, ни консьюмер не
 		// смогут работать вообще, и сервис не имеет смысла поднимать
 		// в состоянии "почти готов".
-		slog.Error("search: не смог обеспечить индекс", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search: не смог обеспечить индекс: %w", err)
 	}
 
 	bulkIndexer := es.NewBulkIndexer(esClient, bulkBatchSize, bulkFlushInterval)
+	// BulkIndexer закрывается ПОСЛЕ остановки обоих консьюмеров (а не через
+	// defer вперемешку с остальными): application.Run ниже блокируется, пока
+	// оба консьюмера не вернут управление (см. её комментарий), и только
+	// после этого возвращает управление сюда — то есть к моменту, когда
+	// сработает вот этот defer, новых Submit в bulkIndexer уже точно не
+	// будет, и Close успевает дождаться реальной отправки последней пачки
+	// в Elasticsearch, а не оборвать её на середине.
+	defer bulkIndexer.Close()
+
 	searchIndex := es.NewSearchIndex(esClient)
 
-	// ── Kafka: консьюмер + retry-консьюмер ───────────────────────────────────
+	// ── Kafka: консьюмер + retry-консьюмер ────────────────────────────────
 	consumer, err := kafkax.NewConsumer(conf.Kafka.Brokers, searchConf.KafkaConsumerGroup, kafkax.TopicListingPublished)
 	if err != nil {
-		slog.Error("search: kafka consumer", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search: kafka consumer: %w", err)
 	}
 	defer consumer.Close()
 
 	retryConsumer, err := kafkax.NewRetryConsumer(conf.Kafka.Brokers, searchConf.KafkaConsumerGroup+"-retry", kafkax.TopicListingPublished)
 	if err != nil {
-		slog.Error("search: kafka retry-consumer", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("search: kafka retry-consumer: %w", err)
 	}
 	defer retryConsumer.Close()
 
-	// ── Слои ─────────────────────────────────────────────────────────────────
-	indexer := app.NewIndexer(bulkIndexer)
-	searchService := app.NewSearchService(searchIndex)
-
-	// ── gRPC-сервер ──────────────────────────────────────────────────────────
-	searchServer := searchgrpc.NewServer(searchService)
-	grpcHealth := grpcx.NewHealth()
-
-	grpcServer := grpcx.NewServer(grpcx.ServerParams{
-		ServiceName: serviceName,
-		JWTSecret:   []byte(conf.GRPC.JWTSecret),
-		// Поиск — публичная витрина, как чтение каталога: браузер и
-		// grpcurl обязаны достучаться без токена.
-		PublicMethods: []string{
-			searchv1.SearchService_Search_FullMethodName,
-		},
-		DefaultTimeout: conf.GRPC.DefaultTimeout,
+	application, err := bootstrap.NewApp(bootstrap.Deps{
+		SearchIndex:       searchIndex,
+		IndexWriter:       bulkIndexer,
+		Consumer:          consumer,
+		RetryConsumer:     retryConsumer,
+		ElasticsearchPing: esClient.Ping,
+		JWTSecret:         conf.GRPC.JWTSecret,
+		DefaultTimeout:    conf.GRPC.DefaultTimeout,
+		GRPCAddr:          searchConf.GRPCAddr,
+		HTTPAddr:          searchConf.HTTPAddr,
+		MetricsAddr:       searchConf.MetricsAddr,
 	})
-	searchv1.RegisterSearchServiceServer(grpcServer, searchServer)
-	grpcHealth.Register(grpcServer)
-
-	// ── Готовность ───────────────────────────────────────────────────────────
-	health := httpx.NewHealth()
-	health.Register("elasticsearch", esClient.Ping)
-	health.Register("kafka_consumer", consumer.Ping)
-
-	router := http.NewServeMux()
-	health.Handle(router, serviceName)
-
-	httpServer := httpx.NewServer(
-		httpx.DefaultServerConfig(searchConf.HTTPAddr),
-		httpx.Chain(router, httpx.Default(serviceName)...),
-	)
-
-	// ── Запуск ───────────────────────────────────────────────────────────────
-	metricsServer := httpx.ServeMetricsAndPprof(searchConf.MetricsAddr)
-	go httpx.Serve(httpServer, "public")
-
-	grpcDone := make(chan struct{})
-	go func() {
-		defer close(grpcDone)
-		if err := grpcx.Serve(grpcServer, searchConf.GRPCAddr, serviceName); err != nil {
-			slog.Error("search: gRPC остановлен", "error", err)
-		}
-	}()
-
-	consumerDone := make(chan struct{})
-	go func() {
-		defer close(consumerDone)
-		if err := consumer.Run(ctx, indexer.HandleListingPublished); err != nil {
-			slog.Error("search: консьюмер остановлен", "error", err)
-		}
-	}()
-
-	go func() {
-		if err := retryConsumer.Run(ctx, indexer.HandleListingPublished); err != nil {
-			slog.Error("search: retry-консьюмер остановлен", "error", err)
-		}
-	}()
-
-	// ── Остановка ────────────────────────────────────────────────────────────
-	<-ctx.Done()
-	slog.Info("search: останавливаюсь…")
-
-	health.NotReady()
-	grpcHealth.NotServing()
-	time.Sleep(2 * time.Second)
-
-	httpx.Shutdown(ctx, 15*time.Second, httpServer, metricsServer)
-	grpcx.Shutdown(grpcServer, 15*time.Second)
-
-	// Консьюмеру даём доработать текущее сообщение — тот же приём, что и
-	// в catalog/cmd/catalog/main.go.
-	select {
-	case <-consumerDone:
-	case <-time.After(15 * time.Second):
-		slog.Warn("search: консьюмер не остановился вовремя")
+	if err != nil {
+		return fmt.Errorf("search: сборка приложения: %w", err)
 	}
+	defer func() {
+		if err := application.Close(); err != nil {
+			slog.Error("search: закрытие приложения", "error", err)
+		}
+	}()
 
-	// BulkIndexer закрывается ПОСЛЕ остановки консьюмера (а не через defer
-	// вперемешку с остальными): к этому моменту новых Submit уже точно не
-	// будет, и Close успевает дождаться реальной отправки последней пачки
-	// в Elasticsearch, а не оборвать её на середине.
-	bulkIndexer.Close()
+	// Run блокируется до отмены ctx (сигнал) или фатального сбоя сервера
+	// и сама проводит graceful shutdown серверов и обоих консьюмеров.
+	return application.Run(ctx)
+}
 
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := shutdownOtel(shutdownCtx); err != nil {
-		slog.Error("search: otel shutdown", "error", err)
+// main — три строки: вызвать run(), при ошибке залогировать и os.Exit(1).
+// os.Exit здесь безопасен: run() к этому моменту уже вернула управление,
+// и все её defer (закрытие консьюмеров, BulkIndexer, otel) успели
+// отработать до этой строки, а не обрываются вызовом os.Exit.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("search: приложение остановлено с ошибкой", "error", err.Error())
+		os.Exit(1)
 	}
-	slog.Info("search: остановлен")
 }

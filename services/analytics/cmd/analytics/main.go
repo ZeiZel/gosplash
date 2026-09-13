@@ -12,33 +12,52 @@
 //	                    docs/adr/0016-clickhouse-kafka-engine.md.
 //	HTTP :8106        — /healthz, /readyz (ClickHouse ping + Kafka ping).
 //	HTTP :8206        — служебный: /metrics и /debug/pprof.
+//
+// Про cmd/seed (соседний бинарник этого сервиса) — см. его package doc:
+// это одноразовая утилита засева демо-данных, а не второй процесс рантайма,
+// поэтому она НЕ проходит через internal/bootstrap (там нечего запускать
+// и не с чем graceful-стопиться — только один синхронный проход и выход).
+//
+// Файл разделён на bootstrap.App (чистая сборка зависимостей), run()
+// (конфиг/соединения/сигналы/graceful shutdown) и main() — см. STYLE.md
+// и internal/bootstrap про причину.
 package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	analyticsv1 "gosplash/gen/go/gosplash/analytics/v1"
 	"gosplash/pkg/config"
-	"gosplash/pkg/grpcx"
-	"gosplash/pkg/httpx"
 	"gosplash/pkg/otelx"
 
 	analyticsch "gosplash/services/analytics/internal/adapters/clickhouse"
-	analyticsgrpc "gosplash/services/analytics/internal/adapters/grpc"
 	analyticskafka "gosplash/services/analytics/internal/adapters/kafka"
 	"gosplash/services/analytics/internal/app"
+	"gosplash/services/analytics/internal/bootstrap"
 	"gosplash/services/analytics/migrations"
 )
 
 const serviceName = "analytics"
 
-func main() {
+// otelShutdownTimeout — сколько ждём выгрузки последних трейсов/метрик
+// после того, как серверы уже остановлены.
+const otelShutdownTimeout = 5 * time.Second
+
+// migrateTimeout — миграции ClickHouse выполняются один раз на старте,
+// см. migrations/auto.go.
+const migrateTimeout = 30 * time.Second
+
+// run — жизненный цикл процесса: конфиг, соединения, запуск App, ожидание
+// сигнала, graceful shutdown. Возвращает ошибку вместо os.Exit — все defer
+// (закрытие ClickHouse-клиента, консьюмеров, выгрузка otel) успевают
+// отработать независимо от того, на каком шаге всё пошло не так. Раньше
+// os.Exit(1) внутри main() обрывал их (gocritic: exitAfterDefer).
+func run() error {
 	// Вся конфигурация — из pkg/config: единственное место в проекте, где
 	// вызывается os.Getenv (docs/STYLE.md).
 	conf := config.Load()
@@ -56,9 +75,15 @@ func main() {
 		LogLevel:         conf.Observe.LogLevel,
 	})
 	if err != nil {
-		slog.Error("analytics: наблюдаемость", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("analytics: наблюдаемость: %w", err)
 	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), otelShutdownTimeout)
+		defer cancel()
+		if err := shutdownOtel(shutdownCtx); err != nil {
+			slog.Error("analytics: otel shutdown", "error", err)
+		}
+	}()
 
 	if conf.GRPC.JWTSecret == "" {
 		slog.Warn("analytics: JWT_SECRET пуст — gRPC-аутентификация выключена, это нормально только для локальной разработки")
@@ -74,132 +99,65 @@ func main() {
 		ReadTimeout: local.ClickHouse.ReadTimeout,
 	})
 	if err != nil {
-		slog.Error("analytics: clickhouse", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("analytics: clickhouse: %w", err)
 	}
 	defer chClient.Close()
 
 	// Миграции — idempotent-но при каждом старте, см. migrations/auto.go
 	// (почему обычным SQL, а не GORM) и services/catalog/migrations/auto.go
 	// (тот же приём для DDL, которого нет в словаре GORM).
-	migrateCtx, cancelMigrate := context.WithTimeout(ctx, 30*time.Second)
+	migrateCtx, cancelMigrate := context.WithTimeout(ctx, migrateTimeout)
 	err = migrations.Migrate(migrateCtx, chClient.Conn)
 	cancelMigrate()
 	if err != nil {
-		slog.Error("analytics: миграции clickhouse", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("analytics: миграции clickhouse: %w", err)
 	}
 
-	// ── Слои ─────────────────────────────────────────────────────────────────
+	// ── Слои: ClickHouse уже открыт — заворачиваем его в порты, которых
+	// просит bootstrap.NewApp (см. её Deps про причину) ─────────────────────
 	repository := analyticsch.NewRepository(chClient.Conn)
 	viewWriter := analyticsch.NewViewWriter(chClient.Conn, local.ViewBatchSize, local.ViewBatchFlushInterval)
 	purchaseWriter := analyticsch.NewPurchaseWriter(chClient.Conn, local.PurchaseBatchSize, local.PurchaseBatchFlushInterval)
-
-	statsService := app.NewStatsService(repository)
 	ingest := app.NewIngest(viewWriter, purchaseWriter)
 
-	// ── Kafka: два независимых консьюмера ─────────────────────────────────────
+	// ── Kafka: два независимых консьюмера ───────────────────────────────────
 	consumers, err := analyticskafka.New(conf.Kafka.Brokers, local.KafkaConsumerGroup, ingest)
 	if err != nil {
-		slog.Error("analytics: kafka", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("analytics: kafka: %w", err)
 	}
 	defer consumers.Close()
 
-	// ── gRPC-сервер ──────────────────────────────────────────────────────────
-	analyticsServer := analyticsgrpc.NewServer(statsService)
-	grpcHealth := grpcx.NewHealth()
-
-	grpcServer := grpcx.NewServer(grpcx.ServerParams{
-		ServiceName: serviceName,
-		JWTSecret:   []byte(conf.GRPC.JWTSecret),
-		// Оба метода читают только СВОДКИ (см. комментарий сервиса в
-		// proto/gosplash/analytics/v1/analytics.proto) — публичная витрина
-		// отчётов, а не персональные данные пользователя, поэтому она,
-		// как и чтение каталога в catalog-service, доступна без токена.
-		PublicMethods: []string{
-			analyticsv1.AnalyticsService_TopPhotos_FullMethodName,
-			analyticsv1.AnalyticsService_PhotoStats_FullMethodName,
-		},
+	application, err := bootstrap.NewApp(bootstrap.Deps{
+		StatsReader:    repository,
+		Consumers:      consumers,
+		ClickHousePing: chClient.Ping,
+		JWTSecret:      conf.GRPC.JWTSecret,
 		DefaultTimeout: conf.GRPC.DefaultTimeout,
+		GRPCAddr:       local.GRPCAddr,
+		HTTPAddr:       local.HTTPAddr,
+		MetricsAddr:    local.MetricsAddr,
 	})
-	analyticsv1.RegisterAnalyticsServiceServer(grpcServer, analyticsServer)
-	grpcHealth.Register(grpcServer)
-
-	// ── Готовность ───────────────────────────────────────────────────────────
-	health := httpx.NewHealth()
-	health.Register("clickhouse", chClient.Ping)
-	health.Register("kafka_views", consumers.PingViews)
-	health.Register("kafka_purchases", consumers.PingPurchases)
-
-	// Публичного HTTP API у сервиса нет (см. proto: наружу — только gRPC),
-	// поэтому на публичном порту — только health-хендлеры, как заготовка
-	// под /healthz и /readyz; /metrics и /debug/pprof — на служебном порту
-	// ниже (httpx.ServeMetricsAndPprof), в отдельном DefaultServeMux.
-	router := http.NewServeMux()
-	health.Handle(router, serviceName)
-
-	httpServer := httpx.NewServer(
-		httpx.DefaultServerConfig(local.HTTPAddr),
-		httpx.Chain(router, httpx.Default(serviceName)...),
-	)
-
-	// ── Запуск ───────────────────────────────────────────────────────────────
-	metricsServer := httpx.ServeMetricsAndPprof(local.MetricsAddr)
-	go httpx.Serve(httpServer, "public")
-
-	grpcDone := make(chan struct{})
-	go func() {
-		defer close(grpcDone)
-		if err := grpcx.Serve(grpcServer, local.GRPCAddr, serviceName); err != nil {
-			slog.Error("analytics: gRPC остановлен", "error", err)
-		}
-	}()
-
-	viewsDone := make(chan struct{})
-	go func() {
-		defer close(viewsDone)
-		if err := consumers.RunViews(ctx); err != nil {
-			slog.Error("analytics: консьюмер просмотров остановлен", "error", err)
-		}
-	}()
-
-	purchasesDone := make(chan struct{})
-	go func() {
-		defer close(purchasesDone)
-		if err := consumers.RunPurchases(ctx); err != nil {
-			slog.Error("analytics: консьюмер покупок остановлен", "error", err)
-		}
-	}()
-
-	// ── Остановка ────────────────────────────────────────────────────────────
-	<-ctx.Done()
-	slog.Info("analytics: останавливаюсь…")
-
-	health.NotReady()
-	grpcHealth.NotServing()
-	time.Sleep(2 * time.Second)
-
-	httpx.Shutdown(ctx, 15*time.Second, httpServer, metricsServer)
-	grpcx.Shutdown(grpcServer, 15*time.Second)
-
-	waitAll := func(timeout time.Duration, chans ...<-chan struct{}) {
-		deadline := time.After(timeout)
-		for _, ch := range chans {
-			select {
-			case <-ch:
-			case <-deadline:
-				slog.Warn("analytics: консьюмер не остановился вовремя")
-				return
-			}
-		}
+	if err != nil {
+		return fmt.Errorf("analytics: сборка приложения: %w", err)
 	}
-	waitAll(15*time.Second, viewsDone, purchasesDone)
+	defer func() {
+		if err := application.Close(); err != nil {
+			slog.Error("analytics: закрытие приложения", "error", err)
+		}
+	}()
 
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := shutdownOtel(shutdownCtx); err != nil {
-		slog.Error("analytics: otel shutdown", "error", err)
+	// Run блокируется до отмены ctx (сигнал) или фатального сбоя сервера
+	// и сама проводит graceful shutdown серверов и консьюмеров.
+	return application.Run(ctx)
+}
+
+// main — три строки: вызвать run(), при ошибке залогировать и os.Exit(1).
+// os.Exit здесь безопасен: run() к этому моменту уже вернула управление,
+// и все её defer (закрытие ClickHouse, консьюмеров, otel) успели
+// отработать до этой строки, а не обрываются вызовом os.Exit.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("analytics: приложение остановлено с ошибкой", "error", err.Error())
+		os.Exit(1)
 	}
-	slog.Info("analytics: остановлен")
 }

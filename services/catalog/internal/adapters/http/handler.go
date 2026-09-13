@@ -56,7 +56,10 @@ func Register(router *http.ServeMux, grpcServer *cataloggrpc.Server, service *ap
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	limit := int32(20)
 	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+		// ParseInt с разрядностью 32, а не Atoi с приведением: так приведения
+		// int→int32 нет вовсе, и вопрос «а влезет ли» не возникает. Значение
+		// приходит из query-строки, то есть от кого угодно.
+		if n, err := strconv.ParseInt(v, 10, 32); err == nil && n > 0 && n <= 100 {
 			limit = int32(n)
 		}
 	}

@@ -13,14 +13,23 @@
 //	HTTP :8105             — /healthz, /readyz.
 //	HTTP :8203             — служебный: /metrics и /debug/pprof.
 //
-// Композиция зависимостей собирается здесь и только здесь: main видит всю
-// программу целиком, а пакеты ниже не знают, откуда берутся их зависимости.
+// main.go разделён на три части (PATTERN: composition root, по образцу
+// ZeiZel/gomple/cmd/main.go):
+//
+//	bootstrap.NewApp — чистая сборка HTTP-сервера и держателя фоновых
+//	                   процессов, живёт в internal/bootstrap и потому
+//	                   тестируется без докера (internal/bootstrap/app_test.go).
+//	run              — жизненный цикл: конфиг, соединения, запуск, сигнал,
+//	                   graceful shutdown. Возвращает ошибку, а не зовёт
+//	                   os.Exit — лекарство от gocritic exitAfterDefer: пока
+//	                   os.Exit не вызван НИ РАЗУ до возврата из run, все
+//	                   defer гарантированно отрабатывают.
+//	main             — три строки: run, лог ошибки, os.Exit(1).
 package main
 
 import (
 	"context"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
@@ -41,11 +50,12 @@ import (
 	thumbredis "gosplash/services/thumbnail-worker/internal/adapters/redis"
 	thumbs3 "gosplash/services/thumbnail-worker/internal/adapters/s3"
 	"gosplash/services/thumbnail-worker/internal/app"
+	"gosplash/services/thumbnail-worker/internal/bootstrap"
 )
 
 const serviceName = "thumbnail-worker"
 
-func main() {
+func run() error {
 	conf := config.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -63,8 +73,7 @@ func main() {
 		LogLevel:         conf.Observe.LogLevel,
 	})
 	if err != nil {
-		slog.Error("thumbnail-worker: наблюдаемость", "error", err)
-		os.Exit(1)
+		return err
 	}
 
 	// ── PostgreSQL ────────────────────────────────────────────────────────────
@@ -88,8 +97,7 @@ func main() {
 	// internal/adapters/pg/repository.go.
 	shards, err := dbx.NewShards(conf.Media.ShardDSNs)
 	if err != nil {
-		slog.Error("thumbnail-worker: postgres", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer shards.Close()
 	slog.Info("thumbnail-worker: подключено шардов", "count", shards.Count())
@@ -100,8 +108,7 @@ func main() {
 	// internal/adapters/s3.
 	storage, err := thumbs3.New(conf.S3.Endpoint, conf.S3.AccessKey, conf.S3.SecretKey, conf.S3.UseSSL)
 	if err != nil {
-		slog.Error("thumbnail-worker: s3", "error", err)
-		os.Exit(1)
+		return err
 	}
 
 	// ── Redis (лок) ──────────────────────────────────────────────────────────
@@ -116,8 +123,7 @@ func main() {
 		ReadTimeout: conf.Redis.ReadTimeout,
 	})
 	if err != nil {
-		slog.Error("thumbnail-worker: redis", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer redisClient.Close()
 
@@ -147,8 +153,7 @@ func main() {
 	// ── Kafka: основной консьюмер + retry ────────────────────────────────────
 	consumer, err := kafkax.NewConsumer(conf.Kafka.Brokers, conf.Kafka.ThumbnailGroup, kafkax.TopicPhotoUploaded)
 	if err != nil {
-		slog.Error("thumbnail-worker: kafka consumer", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer consumer.Close()
 
@@ -159,8 +164,7 @@ func main() {
 	// группы, а это два разных топика с разными требованиями к задержке.
 	retryConsumer, err := kafkax.NewRetryConsumer(conf.Kafka.Brokers, conf.Kafka.ThumbnailGroup+"-retry", kafkax.TopicPhotoUploaded)
 	if err != nil {
-		slog.Error("thumbnail-worker: kafka retry-consumer", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer retryConsumer.Close()
 
@@ -176,83 +180,43 @@ func main() {
 		BatchSize:    conf.Outbox.BatchSize,
 	})
 	if err != nil {
-		slog.Error("thumbnail-worker: outbox relay", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer relay.Close()
 
 	// ── Готовность ───────────────────────────────────────────────────────────
-	health := httpx.NewHealth()
-	health.Register("postgres", repository.Ping)
-	health.Register("kafka", consumer.Ping)
-	health.Register("redis", func(ctx context.Context) error { return redisClient.Ping(ctx) })
-	health.Register("s3", func(ctx context.Context) error { return storage.Ping(ctx, conf.S3.BucketOriginals) })
-	health.Register("outbox", relay.Ping)
-
-	// ── HTTP (только health — публичного API у воркера нет) ──────────────────
-	router := http.NewServeMux()
-	health.Handle(router, serviceName)
-	httpServer := httpx.NewServer(
-		httpx.DefaultServerConfig(conf.Thumbnail.HTTPAddr),
-		httpx.Chain(router, httpx.Default(serviceName)...),
-	)
-
-	// ── Запуск ───────────────────────────────────────────────────────────────
-	metricsServer := httpx.ServeMetricsAndPprof(conf.Thumbnail.MetricsAddr)
-	go httpx.Serve(httpServer, "public")
-
-	consumerDone := make(chan struct{})
-	go func() {
-		defer close(consumerDone)
-		if err := consumer.Run(ctx, handler); err != nil {
-			slog.Error("thumbnail-worker: консьюмер остановлен", "error", err)
-		}
-	}()
-
-	retryDone := make(chan struct{})
-	go func() {
-		defer close(retryDone)
-		if err := retryConsumer.Run(ctx, handler); err != nil {
-			slog.Error("thumbnail-worker: retry-консьюмер остановлен", "error", err)
-		}
-	}()
-
-	relayDone := make(chan struct{})
-	go func() {
-		defer close(relayDone)
-		if err := relay.Run(ctx); err != nil {
-			slog.Error("thumbnail-worker: outbox relay остановлен", "error", err)
-		}
-	}()
-
-	// ── Остановка ────────────────────────────────────────────────────────────
-	<-ctx.Done()
-	slog.Info("thumbnail-worker: останавливаюсь…")
-
-	// Сначала перестаём быть ready, потом даём балансировщику/оркестратору
-	// время узнать об этом, и только затем гасим сервера — подробности
-	// в комментарии к httpx.Shutdown.
-	health.NotReady()
-	time.Sleep(2 * time.Second)
-
-	httpx.Shutdown(ctx, 15*time.Second, httpServer, metricsServer)
-
-	// Каждому фоновому циклу даём доработать текущую итерацию, а не рвём
-	// по живому: у консьюмеров это текущее сообщение (offset не сдвинут,
-	// значит, при обрыве оно просто приедет снова — не смертельно, но
-	// лишняя повторная обработка), у relay — текущий батч (см. комментарий
-	// к outbox.Relay.Run про то, почему обрыв батча хуже, чем секунда
-	// ожидания).
-	waitFor := func(name string, done <-chan struct{}) {
-		select {
-		case <-done:
-		case <-time.After(15 * time.Second):
-			slog.Warn("thumbnail-worker: не остановился за 15с", "component", name)
-		}
+	healthChecks := map[string]httpx.Check{
+		"postgres": repository.Ping,
+		"kafka":    consumer.Ping,
+		"redis":    func(ctx context.Context) error { return redisClient.Ping(ctx) },
+		"s3":       func(ctx context.Context) error { return storage.Ping(ctx, conf.S3.BucketOriginals) },
+		"outbox":   relay.Ping,
 	}
-	waitFor("consumer", consumerDone)
-	waitFor("retry-consumer", retryDone)
-	waitFor("outbox-relay", relayDone)
+
+	// ── Сборка приложения ────────────────────────────────────────────────────
+	thumbnailApp, err := bootstrap.NewApp(bootstrap.Deps{
+		ServiceName:   serviceName,
+		HTTPAddr:      conf.Thumbnail.HTTPAddr,
+		MetricsAddr:   conf.Thumbnail.MetricsAddr,
+		HealthChecks:  healthChecks,
+		Consumer:      consumer,
+		RetryConsumer: retryConsumer,
+		Handle:        handler,
+		Relay:         relay,
+	})
+	if err != nil {
+		return err
+	}
+	// App.Close подчищает HTTP-сервер, который собрала сама NewApp —
+	// ставим defer сразу после успешной сборки, чтобы он сработал на любом
+	// пути выхода из run, включая ошибку самого Run ниже.
+	defer func() {
+		if err := thumbnailApp.Close(); err != nil {
+			slog.Error("thumbnail-worker: закрытие приложения", "error", err)
+		}
+	}()
+
+	runErr := thumbnailApp.Run(ctx)
 
 	// Наблюдаемость гасится ПОСЛЕДНЕЙ: иначе спаны и метрики самой остановки
 	// не успеют уехать, а это ровно то время, которое интересно смотреть,
@@ -262,5 +226,18 @@ func main() {
 	if err := shutdownOtel(shutdownCtx); err != nil {
 		slog.Error("thumbnail-worker: otel shutdown", "error", err)
 	}
-	slog.Info("thumbnail-worker: остановлен")
+
+	return runErr
+}
+
+// main — три строки. os.Exit здесь безопасен: он выполняется ПОСЛЕ того,
+// как run() вернул управление, то есть после того, как отработали все её
+// defer (закрытие БД, Redis, Kafka-клиентов, outbox-relay). Если бы os.Exit
+// стоял внутри run на путях ошибок (как было до рефакторинга), эти defer
+// пропускались бы — это и есть gocritic exitAfterDefer, который ловит CI.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("thumbnail-worker: приложение остановлено с ошибкой", "error", err)
+		os.Exit(1)
+	}
 }

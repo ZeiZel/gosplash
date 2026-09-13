@@ -230,7 +230,7 @@ func failOrder(ctx workflow.Context, logger log.Logger, orderID string, cause er
 				// завершается ошибкой, и незавершённая сага остаётся
 				// видна в Temporal UI как повод для ручного вмешательства.
 				logger.Error("компенсация не выполнена", "order_id", orderID, "error", err.Error())
-				return fmt.Errorf("компенсация заказа %s не выполнена: %w (исходная причина: %v)", orderID, err, cause)
+				return fmt.Errorf("компенсация заказа %s не выполнена: %w (исходная причина: %w)", orderID, err, cause)
 			}
 		}
 	}

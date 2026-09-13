@@ -111,6 +111,6 @@ func TestDecode_PustyeBaytyOshibka(t *testing.T) {
 	_, err := p.Decode(bytes.NewReader(nil))
 
 	require.Error(t, err)
-	var target error = domain.ErrNotAnImage
+	target := domain.ErrNotAnImage
 	assert.True(t, errors.Is(err, target))
 }

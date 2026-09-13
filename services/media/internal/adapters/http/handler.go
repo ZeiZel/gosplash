@@ -111,7 +111,13 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 	// 32 МБ — сколько разрешено держать в памяти; остальное multipart-парсер
 	// сбросит во временный файл. Сам файл мы отсюда не читаем целиком:
 	// ниже он уезжает в хранилище как поток.
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// nolint:gosec // G120 срабатывает ложно: предел на размер тела стоит
+	// строкой выше (http.MaxBytesReader), а анализатор не отслеживает поток
+	// данных через r.Body и видит только «ParseMultipartForm без обёртки».
+	// Глушим точечно, в одной строке, с объяснением — а не исключением
+	// правила во всём .golangci.yml, где оно перестало бы ловить настоящие
+	// случаи в других хендлерах.
+	if err := r.ParseMultipartForm(32 << 20); err != nil { //nolint:gosec // см. комментарий выше
 		httpx.Error(w, "не удалось разобрать форму: "+err.Error(), http.StatusBadRequest)
 		return
 	}

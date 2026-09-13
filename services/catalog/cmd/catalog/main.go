@@ -16,12 +16,24 @@
 //	View-batcher      — пакетно публикует analytics.photo.viewed (без outbox,
 //	                    см. internal/adapters/kafka/view_batcher.go).
 //	HTTP :8202        — служебный: /metrics и /debug/pprof.
+//
+// main.go разделён на три части (PATTERN: composition root, по образцу
+// ZeiZel/gomple/cmd/main.go):
+//
+//	bootstrap.NewApp — чистая сборка серверов из уже готовых сценариев,
+//	                   живёт в internal/bootstrap и потому тестируется
+//	                   без докера (см. internal/bootstrap/app_test.go).
+//	run              — жизненный цикл: конфиг, соединения, запуск, сигнал,
+//	                   graceful shutdown. Возвращает ошибку, а не зовёт
+//	                   os.Exit — лекарство от gocritic exitAfterDefer: пока
+//	                   os.Exit не вызван НИ РАЗУ до возврата из run, все
+//	                   defer гарантированно отрабатывают.
+//	main             — три строки: run, лог ошибки, os.Exit(1).
 package main
 
 import (
 	"context"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -35,7 +47,6 @@ import (
 	mediav1 "gosplash/gen/go/gosplash/media/v1"
 	"gosplash/pkg/config"
 	"gosplash/pkg/dbx"
-	"gosplash/pkg/grpcx"
 	"gosplash/pkg/httpx"
 	"gosplash/pkg/kafkax"
 	"gosplash/pkg/otelx"
@@ -43,16 +54,16 @@ import (
 	"gosplash/pkg/redisx"
 
 	cataloggrpc "gosplash/services/catalog/internal/adapters/grpc"
-	cataloghttp "gosplash/services/catalog/internal/adapters/http"
 	catalogkafka "gosplash/services/catalog/internal/adapters/kafka"
 	"gosplash/services/catalog/internal/adapters/pg"
 	catalogredis "gosplash/services/catalog/internal/adapters/redis"
 	"gosplash/services/catalog/internal/app"
+	"gosplash/services/catalog/internal/bootstrap"
 )
 
 const serviceName = "catalog"
 
-func main() {
+func run() error {
 	conf := config.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -67,22 +78,13 @@ func main() {
 		LogLevel:         conf.Observe.LogLevel,
 	})
 	if err != nil {
-		slog.Error("catalog: наблюдаемость", "error", err)
-		os.Exit(1)
-	}
-
-	if conf.GRPC.JWTSecret == "" {
-		// docs/STYLE.md и pkg/config: пустой секрет означает выключенную
-		// проверку токена — допустимо только локально, и сервис обязан
-		// сказать об этом в лог, а не выключить аутентификацию молча.
-		slog.Warn("catalog: JWT_SECRET пуст — gRPC-аутентификация выключена, это нормально только для локальной разработки")
+		return err
 	}
 
 	// ── База: primary + реплика за одним соединением ─────────────────────────
 	database, err := dbx.OpenWithReplica(conf.Catalog.PrimaryDSN, conf.Catalog.ReplicaDSN)
 	if err != nil {
-		slog.Error("catalog: postgres", "error", err)
-		os.Exit(1)
+		return err
 	}
 	if conf.Catalog.ReplicaDSN == "" {
 		slog.Warn("catalog: реплика не настроена, читаю из primary")
@@ -100,8 +102,7 @@ func main() {
 		ServiceName: serviceName,
 	})
 	if err != nil {
-		slog.Error("catalog: redis", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer redisClient.Close()
 
@@ -118,16 +119,14 @@ func main() {
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
 	if err != nil {
-		slog.Error("catalog: gRPC к media", "error", err)
-		os.Exit(1)
+		return err
 	}
-	defer mediaConn.Close()
+	defer func() { _ = mediaConn.Close() }()
 
 	// ── Kafka: продюсер (просмотры) и консьюмеры ──────────────────────────────
 	producer, err := kafkax.NewProducer(conf.Kafka.Brokers, serviceName)
 	if err != nil {
-		slog.Error("catalog: kafka producer", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer producer.Close()
 
@@ -146,29 +145,25 @@ func main() {
 
 	uploadedConsumer, err := kafkax.NewConsumer(conf.Kafka.Brokers, conf.Kafka.CatalogGroup, kafkax.TopicPhotoUploaded)
 	if err != nil {
-		slog.Error("catalog: kafka consumer (uploaded)", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer uploadedConsumer.Close()
 
 	thumbnailConsumer, err := kafkax.NewConsumer(conf.Kafka.Brokers, thumbnailGroup, kafkax.TopicPhotoThumbnailReady)
 	if err != nil {
-		slog.Error("catalog: kafka consumer (thumbnail-ready)", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer thumbnailConsumer.Close()
 
 	uploadedRetry, err := kafkax.NewRetryConsumer(conf.Kafka.Brokers, conf.Kafka.CatalogGroup+"-retry", kafkax.TopicPhotoUploaded)
 	if err != nil {
-		slog.Error("catalog: kafka retry-consumer (uploaded)", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer uploadedRetry.Close()
 
 	thumbnailRetry, err := kafkax.NewRetryConsumer(conf.Kafka.Brokers, thumbnailGroup+"-retry", kafkax.TopicPhotoThumbnailReady)
 	if err != nil {
-		slog.Error("catalog: kafka retry-consumer (thumbnail-ready)", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer thumbnailRetry.Close()
 
@@ -181,8 +176,7 @@ func main() {
 		BatchSize:    conf.Outbox.BatchSize,
 	})
 	if err != nil {
-		slog.Error("catalog: outbox relay", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer relay.Close()
 
@@ -195,8 +189,11 @@ func main() {
 	cache := catalogredis.NewCache(redisClient, conf.Catalog.CacheTTL)
 	viewCounter := catalogredis.NewViewCounter(redisClient)
 	// Close вызывается явно на graceful shutdown ниже (а не через defer),
-	// чтобы буфер флашился ДО остановки producer'а, а не в произвольном
-	// порядке вместе с остальными defer'ами main().
+	// чтобы буфер флашился ПОСЛЕ того, как консьюмеры остановились (иначе
+	// новые просмотры могли бы прийти уже после флаша), но ДО закрытия
+	// producer'а (defer выше закроет его позже) — иначе накопленные, но ещё
+	// не отправленные события просмотров были бы потеряны молча вместо
+	// честного флаша.
 	viewBatcher := catalogkafka.NewViewBatcher(producer,
 		conf.Catalog.ViewBatchSize, conf.Catalog.ViewFlushInterval)
 
@@ -205,13 +202,25 @@ func main() {
 	listingService := app.NewListingService(listingRepo, cache, viewCounter, viewBatcher)
 	licenseService := app.NewLicenseService(licenseRepo)
 
-	// ── gRPC-сервер ──────────────────────────────────────────────────────────
-	catalogServer := cataloggrpc.NewServer(listingService, licenseService, hub)
-	grpcHealth := grpcx.NewHealth()
+	// ── Готовность ───────────────────────────────────────────────────────────
+	healthChecks := map[string]httpx.Check{
+		"postgres":        func(ctx context.Context) error { return dbx.Ping(ctx, database) },
+		"kafka_uploaded":  uploadedConsumer.Ping,
+		"kafka_thumbnail": thumbnailConsumer.Ping,
+		"kafka_producer":  producer.Ping,
+		"redis":           redisClient.Ping,
+		"outbox":          relay.Ping,
+	}
 
-	grpcServer := grpcx.NewServer(grpcx.ServerParams{
+	// ── Сборка приложения ────────────────────────────────────────────────────
+	catalogApp, err := bootstrap.NewApp(bootstrap.Deps{
 		ServiceName: serviceName,
-		JWTSecret:   []byte(conf.GRPC.JWTSecret),
+		HTTPAddr:    conf.Catalog.HTTPAddr,
+		GRPCAddr:    conf.Catalog.GRPCAddr,
+		MetricsAddr: conf.Catalog.MetricsAddr,
+
+		JWTSecret:   conf.GRPC.JWTSecret,
+		GRPCTimeout: conf.GRPC.DefaultTimeout,
 		// Чтение каталога — публичная витрина: браузер и grpcurl обязаны
 		// достучаться до неё без токена, как до любого сайта фотостока.
 		// GrantLicense/RevokeLicense остаются под аутентификацией — это
@@ -221,112 +230,63 @@ func main() {
 			catalogv1.CatalogService_ListListings_FullMethodName,
 			catalogv1.CatalogService_WatchListing_FullMethodName,
 		},
-		DefaultTimeout: conf.GRPC.DefaultTimeout,
+
+		ListingService: listingService,
+		LicenseService: licenseService,
+		Hub:            hub,
+
+		HealthChecks: healthChecks,
+
+		Consumers: []bootstrap.ConsumerSpec{
+			{Name: "uploaded", Consumer: uploadedConsumer, Handle: indexer.HandlePhotoUploaded, AwaitOnShutdown: true},
+			{Name: "thumbnail-ready", Consumer: thumbnailConsumer, Handle: indexer.HandlePhotoThumbnailReady, AwaitOnShutdown: true},
+			// Retry-консьюмеры ДО рефакторинга не имели done-канала и не
+			// дожидались остановки — поведение сохранено (AwaitOnShutdown: false).
+			{Name: "uploaded-retry", Consumer: uploadedRetry, Handle: indexer.HandlePhotoUploaded, AwaitOnShutdown: false},
+			{Name: "thumbnail-ready-retry", Consumer: thumbnailRetry, Handle: indexer.HandlePhotoThumbnailReady, AwaitOnShutdown: false},
+		},
+		Relay: relay,
 	})
-	catalogv1.RegisterCatalogServiceServer(grpcServer, catalogServer)
-	grpcHealth.Register(grpcServer)
-
-	// ── Готовность ───────────────────────────────────────────────────────────
-	health := httpx.NewHealth()
-	health.Register("postgres", func(ctx context.Context) error { return dbx.Ping(ctx, database) })
-	health.Register("kafka_uploaded", uploadedConsumer.Ping)
-	health.Register("kafka_thumbnail", thumbnailConsumer.Ping)
-	health.Register("kafka_producer", producer.Ping)
-	health.Register("redis", redisClient.Ping)
-	health.Register("outbox", relay.Ping)
-
-	// ── HTTP ─────────────────────────────────────────────────────────────────
-	router := http.NewServeMux()
-	cataloghttp.Register(router, catalogServer, listingService)
-	health.Handle(router, serviceName)
-
-	httpServer := httpx.NewServer(
-		httpx.DefaultServerConfig(conf.Catalog.HTTPAddr),
-		httpx.Chain(router, httpx.Default(serviceName)...),
-	)
-
-	// ── Запуск ───────────────────────────────────────────────────────────────
-	metricsServer := httpx.ServeMetricsAndPprof(conf.Catalog.MetricsAddr)
-	go httpx.Serve(httpServer, "public")
-
-	grpcDone := make(chan struct{})
-	go func() {
-		defer close(grpcDone)
-		if err := grpcx.Serve(grpcServer, conf.Catalog.GRPCAddr, serviceName); err != nil {
-			slog.Error("catalog: gRPC остановлен", "error", err)
-		}
-	}()
-
-	go func() {
-		if err := relay.Run(ctx); err != nil {
-			slog.Error("catalog: outbox relay остановлен", "error", err)
-		}
-	}()
-
-	consumerDone := make(chan struct{})
-	go func() {
-		defer close(consumerDone)
-		if err := uploadedConsumer.Run(ctx, indexer.HandlePhotoUploaded); err != nil {
-			slog.Error("catalog: консьюмер uploaded остановлен", "error", err)
-		}
-	}()
-
-	thumbnailDone := make(chan struct{})
-	go func() {
-		defer close(thumbnailDone)
-		if err := thumbnailConsumer.Run(ctx, indexer.HandlePhotoThumbnailReady); err != nil {
-			slog.Error("catalog: консьюмер thumbnail-ready остановлен", "error", err)
-		}
-	}()
-
-	go func() {
-		if err := uploadedRetry.Run(ctx, indexer.HandlePhotoUploaded); err != nil {
-			slog.Error("catalog: retry-консьюмер uploaded остановлен", "error", err)
-		}
-	}()
-
-	go func() {
-		if err := thumbnailRetry.Run(ctx, indexer.HandlePhotoThumbnailReady); err != nil {
-			slog.Error("catalog: retry-консьюмер thumbnail-ready остановлен", "error", err)
-		}
-	}()
-
-	// ── Остановка ────────────────────────────────────────────────────────────
-	<-ctx.Done()
-	slog.Info("catalog: останавливаюсь…")
-
-	health.NotReady()
-	grpcHealth.NotServing()
-	time.Sleep(2 * time.Second)
-
-	httpx.Shutdown(ctx, 15*time.Second, httpServer, metricsServer)
-	grpcx.Shutdown(grpcServer, 15*time.Second)
-
-	// Консьюмерам даём доработать текущее сообщение. Оборвать его на середине
-	// не смертельно (offset не сдвинут, сообщение приедет снова), но каждый
-	// такой обрыв — это лишняя повторная обработка после рестарта.
-	waitAll := func(timeout time.Duration, chans ...<-chan struct{}) {
-		deadline := time.After(timeout)
-		for _, ch := range chans {
-			select {
-			case <-ch:
-			case <-deadline:
-				slog.Warn("catalog: консьюмер не остановился вовремя")
-				return
-			}
-		}
+	if err != nil {
+		return err
 	}
-	waitAll(15*time.Second, consumerDone, thumbnailDone)
+	// App.Close подчищает HTTP/gRPC серверы, которые собрала сама NewApp —
+	// ставим defer сразу после успешной сборки, чтобы он сработал на любом
+	// пути выхода из run, включая ошибку самого Run ниже.
+	defer func() {
+		if err := catalogApp.Close(); err != nil {
+			slog.Error("catalog: закрытие приложения", "error", err)
+		}
+	}()
+
+	runErr := catalogApp.Run(ctx)
 
 	// Буфер просмотров сбрасывается ДО закрытия producer'а (defer выше
-	// закроет его позже) — иначе накопленные, но ещё не отправленные
-	// события просмотров были бы потеряны молча вместо честного флаша.
+	// закроет его позже уже после return) — иначе накопленные, но ещё не
+	// отправленные события просмотров были бы потеряны молча вместо
+	// честного флаша.
 	viewBatcher.Close()
 
+	// Наблюдаемость гасится ПОСЛЕДНЕЙ: иначе спаны и метрики самой остановки
+	// не успеют уехать, а это ровно то время, которое интересно смотреть,
+	// когда выкатка прошла плохо.
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := shutdownOtel(shutdownCtx); err != nil {
 		slog.Error("catalog: otel shutdown", "error", err)
 	}
-	slog.Info("catalog: остановлен")
+
+	return runErr
+}
+
+// main — три строки. os.Exit здесь безопасен: он выполняется ПОСЛЕ того,
+// как run() вернул управление, то есть после того, как отработали все её
+// defer (закрытие БД, Redis, Kafka-клиентов, outbox-relay). Если бы os.Exit
+// стоял внутри run на путях ошибок (как было до рефакторинга), эти defer
+// пропускались бы — это и есть gocritic exitAfterDefer, который ловит CI.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("catalog: приложение остановлено с ошибкой", "error", err)
+		os.Exit(1)
+	}
 }

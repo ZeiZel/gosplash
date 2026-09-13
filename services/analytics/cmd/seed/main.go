@@ -41,7 +41,20 @@ import (
 	"gosplash/services/analytics/migrations"
 )
 
-func main() {
+// run — вся утилита целиком: разбор флагов, подключение, миграции, засев.
+// Возвращает ошибку вместо os.Exit, чтобы `defer client.Close()` успевал
+// отработать на любом пути выхода — раньше os.Exit(1) после миграций или
+// самого засева обрывал этот defer (gocritic: exitAfterDefer), и соединение
+// с ClickHouse оставалось висеть до завершения процесса самой ОС.
+//
+// НЕ bootstrap.App: это не сервис с жизненным циклом (нечего Run и не с чем
+// Close — один синхронный проход и выход), а разовая CLI-утилита. Тот же
+// приём run()+main(), что и у сервисов, устраняет ровно ту же находку
+// линтера безо всякой лишней структуры вокруг него — заводить App ради
+// одной функции, которая не слушает сеть и не переживёт этот вызов, было бы
+// решением ради единообразия, а не ради дела (см. задание, «делай осознанно,
+// а не переделывай ради единообразия»).
+func run() error {
 	total := flag.Int("n", 5_000_000, "сколько строк просмотров засеять")
 	batchSize := flag.Int("batch", 50_000, "размер одной batch-вставки")
 	photos := flag.Int("photos", 5000, "сколько различных photo_id использовать")
@@ -59,19 +72,27 @@ func main() {
 		ReadTimeout: local.ClickHouse.ReadTimeout,
 	})
 	if err != nil {
-		slog.Error("analytics-seed: clickhouse", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("analytics-seed: clickhouse: %w", err)
 	}
 	defer client.Close()
 
 	ctx := context.Background()
 	if err := migrations.Migrate(ctx, client.Conn); err != nil {
-		slog.Error("analytics-seed: миграции", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("analytics-seed: миграции: %w", err)
 	}
 
 	if err := seed(ctx, client, *total, *batchSize, *photos, *windowDays); err != nil {
-		slog.Error("analytics-seed: засев", "error", err)
+		return fmt.Errorf("analytics-seed: засев: %w", err)
+	}
+	return nil
+}
+
+// main — три строки: вызвать run(), при ошибке залогировать и os.Exit(1).
+// os.Exit здесь безопасен: run() уже вернула управление, и её defer
+// (закрытие клиента ClickHouse) успел отработать до этой строки.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("analytics-seed: остановлено с ошибкой", "error", err.Error())
 		os.Exit(1)
 	}
 }

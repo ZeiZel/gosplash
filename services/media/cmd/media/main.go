@@ -8,42 +8,44 @@
 //	                   и gRPC записали в таблицу outbox (docs/adr/0008-*).
 //	HTTP :8201       — служебный: /metrics для Prometheus и /debug/pprof.
 //
-// Композиция зависимостей собирается здесь и только здесь: main видит всю
-// программу целиком, а пакеты ниже не знают, откуда берутся их зависимости,
-// и потому легко подменяются в тестах. Никакого DI-контейнера — обычные
-// конструкторы.
+// main.go разделён на три части (PATTERN: composition root, по образцу
+// ZeiZel/gomple/cmd/main.go):
+//
+//	bootstrap.NewApp — чистая сборка серверов из уже открытых соединений,
+//	                   живёт в internal/bootstrap и потому тестируется
+//	                   без докера (см. internal/bootstrap/app_test.go).
+//	run              — жизненный цикл: конфиг, соединения, запуск, сигнал,
+//	                   graceful shutdown. Возвращает ошибку, а не зовёт
+//	                   os.Exit — это и есть лекарство от gocritic
+//	                   exitAfterDefer: пока os.Exit не вызван НИ РАЗУ до
+//	                   возврата из run, все defer гарантированно отрабатывают.
+//	main             — три строки: run, лог ошибки, os.Exit(1).
 package main
 
 import (
 	"context"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"google.golang.org/grpc/reflection"
-
-	mediav1 "gosplash/gen/go/gosplash/media/v1"
 	"gosplash/pkg/config"
 	"gosplash/pkg/dbx"
-	"gosplash/pkg/grpcx"
 	"gosplash/pkg/httpx"
 	"gosplash/pkg/otelx"
 	"gosplash/pkg/outbox"
 	"gosplash/pkg/redisx"
 	"gosplash/pkg/s3x"
 
-	mediagrpc "gosplash/services/media/internal/adapters/grpc"
-	mediahttp "gosplash/services/media/internal/adapters/http"
 	"gosplash/services/media/internal/adapters/pg"
 	"gosplash/services/media/internal/app"
+	"gosplash/services/media/internal/bootstrap"
 )
 
 const serviceName = "media"
 
-func main() {
+func run() error {
 	conf := config.Load()
 
 	// ── Наблюдаемость поднимается ПЕРВОЙ ─────────────────────────────────────
@@ -61,23 +63,24 @@ func main() {
 		LogLevel:         conf.Observe.LogLevel,
 	})
 	if err != nil {
-		slog.Error("media: наблюдаемость", "error", err)
-		os.Exit(1)
+		return err
 	}
 
 	// ── Инфраструктура ───────────────────────────────────────────────────────
+	// Каждое успешно открытое соединение сразу получает defer на закрытие:
+	// возврат ошибки ниже (в отличие от os.Exit) гарантированно проходит
+	// через все уже зарегистрированные defer, поэтому частично поднятая
+	// инфраструктура не течёт при неудачном старте.
 	shards, err := dbx.NewShards(conf.Media.ShardDSNs)
 	if err != nil {
-		slog.Error("media: postgres", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer shards.Close()
 	slog.Info("media: подключено шардов", "count", shards.Count())
 
 	storage, err := s3x.New(conf.S3.Endpoint, conf.S3.AccessKey, conf.S3.SecretKey, conf.S3.UseSSL)
 	if err != nil {
-		slog.Error("media: s3", "error", err)
-		os.Exit(1)
+		return err
 	}
 
 	// redisx.New не пытается подключиться немедленно (пул go-redis ленивый),
@@ -96,8 +99,7 @@ func main() {
 		ReadTimeout: conf.Redis.ReadTimeout,
 	})
 	if err != nil {
-		slog.Error("media: redis", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer redisClient.Close()
 
@@ -116,9 +118,13 @@ func main() {
 		BatchSize:    conf.Outbox.BatchSize,
 	})
 	if err != nil {
-		slog.Error("media: outbox relay", "error", err)
-		os.Exit(1)
+		return err
 	}
+	// App.Run дожидается остановки relay (relayDone) ПЕРЕД тем, как
+	// вернуть управление, — так что к моменту, когда сработает этот defer,
+	// Run гарантированно уже вернул управление, и закрывать пулы/продюсер
+	// relay безопасно (см. комментарий к outbox.Relay.Close).
+	defer relay.Close()
 
 	// ── Слои ─────────────────────────────────────────────────────────────────
 	repository := pg.NewPhotoRepository(shards)
@@ -145,97 +151,53 @@ func main() {
 	// сервис неготовым принимать трафик именно тогда, когда он готов
 	// принимать загрузки без ограничения — то есть свести на нет весь смысл
 	// fail-open одной строчкой в main.
-	health := httpx.NewHealth()
-	health.Register("postgres", shards.Ping)
+	healthChecks := map[string]httpx.Check{
+		"postgres": shards.Ping,
+	}
 
-	// ── HTTP ─────────────────────────────────────────────────────────────────
-	router := http.NewServeMux()
-	mediahttp.Register(router, mediahttp.Deps{
+	// ── Сборка приложения ────────────────────────────────────────────────────
+	mediaApp, err := bootstrap.NewApp(bootstrap.Deps{
+		ServiceName: serviceName,
+		HTTPAddr:    conf.Media.HTTPAddr,
+		GRPCAddr:    conf.Media.GRPCAddr,
+		MetricsAddr: conf.Media.MetricsAddr,
+
+		// Загрузка 50 МБ по медленному каналу не должна обрываться сервером,
+		// поэтому у media таймауты на чтение и запись тела больше общих.
+		HTTPReadTimeout:  5 * time.Minute,
+		HTTPWriteTimeout: 5 * time.Minute,
+
+		JWTSecret:   conf.GRPC.JWTSecret,
+		GRPCTimeout: conf.GRPC.DefaultTimeout,
+		// GetPhoto пока публичный: аутентификация запросов между сервисами
+		// (catalog → media) появится вместе с service-to-service токенами,
+		// это отдельная задача. Полное имя метода, а не аннотация в .proto —
+		// pkg/grpcx не читает protobuf-опции (см. комментарий в interceptors.go).
+		PublicMethods: []string{"/gosplash.media.v1.MediaService/GetPhoto"},
+
 		Service:                service,
 		MaxBodyBytes:           50 << 20,
 		PresignedTTL:           conf.S3.PresignedTTL,
 		Limiter:                redisClient,
 		UploadRateCapacity:     conf.Media.UploadRateCapacity,
 		UploadRateRefillPerSec: conf.Media.UploadRateRefillPerSec,
+
+		HealthChecks: healthChecks,
+		Relay:        relay,
 	})
-	health.Handle(router, serviceName)
-
-	httpCfg := httpx.DefaultServerConfig(conf.Media.HTTPAddr)
-	// Загрузка 50 МБ по медленному каналу не должна обрываться сервером,
-	// поэтому у media таймауты на чтение и запись тела больше общих.
-	httpCfg.ReadTimeout = 5 * time.Minute
-	httpCfg.WriteTimeout = 5 * time.Minute
-	httpServer := httpx.NewServer(httpCfg, httpx.Chain(router, httpx.Default(serviceName)...))
-
-	// ── gRPC ─────────────────────────────────────────────────────────────────
-	if conf.GRPC.JWTSecret == "" {
-		// Пустой секрет отключает проверку подписи ВСЕМ методам, кроме
-		// PublicMethods (см. authUnaryInterceptor в pkg/grpcx), — не тихо,
-		// а с явным предупреждением, чтобы выключенная аутентификация не
-		// уехала в прод незамеченной.
-		slog.Warn("media: JWT_SECRET пуст, gRPC-аутентификация выключена — допустимо только локально")
+	if err != nil {
+		return err
 	}
-
-	grpcHealth := grpcx.NewHealth()
-	grpcServer := grpcx.NewServer(grpcx.ServerParams{
-		ServiceName: serviceName,
-		JWTSecret:   []byte(conf.GRPC.JWTSecret),
-		// GetPhoto пока публичный: аутентификация запросов между сервисами
-		// (catalog → media) появится вместе с service-to-service токенами,
-		// это отдельная задача. Полное имя метода, а не аннотация в .proto —
-		// pkg/grpcx не читает protobuf-опции (см. комментарий в interceptors.go).
-		PublicMethods:  []string{"/gosplash.media.v1.MediaService/GetPhoto"},
-		DefaultTimeout: conf.GRPC.DefaultTimeout,
-	})
-	mediav1.RegisterMediaServiceServer(grpcServer, mediagrpc.NewServer(service))
-	grpcHealth.Register(grpcServer)
-	// Reflection позволяет grpcurl вызывать методы без .proto-файла под рукой:
-	//   grpcurl -plaintext localhost:9101 list
-	// В проде обычно выключают, локально — незаменимо.
-	reflection.Register(grpcServer)
-
-	// ── Запуск ───────────────────────────────────────────────────────────────
-	metricsServer := httpx.ServeMetricsAndPprof(conf.Media.MetricsAddr)
-	go httpx.Serve(httpServer, "public")
-
-	go func() {
-		if err := grpcx.Serve(grpcServer, conf.Media.GRPCAddr, serviceName); err != nil {
-			slog.Error("media: grpc", "error", err)
+	// App.Close подчищает HTTP/gRPC серверы, которые собрала сама NewApp —
+	// ставим defer сразу после успешной сборки, чтобы он сработал на любом
+	// пути выхода из run, включая ошибку самого Run ниже.
+	defer func() {
+		if err := mediaApp.Close(); err != nil {
+			slog.Error("media: закрытие приложения", "error", err)
 		}
 	}()
 
-	relayDone := make(chan struct{})
-	go func() {
-		defer close(relayDone)
-		if err := relay.Run(ctx); err != nil {
-			slog.Error("media: outbox relay остановлен", "error", err)
-		}
-	}()
-
-	// ── Остановка ────────────────────────────────────────────────────────────
-	<-ctx.Done()
-	slog.Info("media: останавливаюсь…")
-
-	// Сначала перестаём быть ready, потом ждём, пока об этом узнает
-	// балансировщик, и только затем закрываем соединения. Подробности —
-	// в комментарии к httpx.Shutdown.
-	health.NotReady()
-	grpcHealth.NotServing()
-	time.Sleep(2 * time.Second)
-
-	httpx.Shutdown(ctx, 15*time.Second, httpServer, metricsServer)
-	grpcx.Shutdown(grpcServer, 15*time.Second)
-
-	// Relay'ю даём доработать текущий батч (см. комментарий к Relay.Run —
-	// он и сам не оборвёт его на середине), а закрываем его пулы и продюсер
-	// уже ПОСЛЕ того, как Run гарантированно вернул управление — иначе
-	// последний батч останется без соединений на середине публикации.
-	select {
-	case <-relayDone:
-	case <-time.After(15 * time.Second):
-		slog.Warn("media: outbox relay не остановился за 15с")
-	}
-	relay.Close()
+	runErr := mediaApp.Run(ctx)
 
 	// Наблюдаемость гасится ПОСЛЕДНЕЙ: иначе спаны и метрики самой остановки
 	// не успеют уехать, а это ровно то время, которое интересно смотреть,
@@ -245,5 +207,18 @@ func main() {
 	if err := shutdownOtel(shutdownCtx); err != nil {
 		slog.Error("media: otel shutdown", "error", err)
 	}
-	slog.Info("media: остановлен")
+
+	return runErr
+}
+
+// main — три строки. os.Exit здесь безопасен: он выполняется ПОСЛЕ того,
+// как run() вернул управление, то есть после того, как отработали все её
+// defer (закрытие БД, Redis, outbox-relay). Если бы os.Exit стоял внутри
+// run на путях ошибок (как было до рефакторинга), defer'ы этой функции
+// пропускались бы — это и есть gocritic exitAfterDefer, который ловит CI.
+func main() {
+	if err := run(); err != nil {
+		slog.Error("media: приложение остановлено с ошибкой", "error", err)
+		os.Exit(1)
+	}
 }
