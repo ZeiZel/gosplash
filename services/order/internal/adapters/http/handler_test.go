@@ -94,7 +94,7 @@ func newTestRouter() (*http.ServeMux, *fakeIdempotencyStore) {
 func TestPlaceOrder_BezZagolovkaIdempotencyKey_400(t *testing.T) {
 	router, _ := newTestRouter()
 
-	req := httptest.NewRequest(http.MethodPost, "/orders",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/orders",
 		strings.NewReader(`{"buyer_id":1,"listing_id":"listing-1"}`))
 	rec := httptest.NewRecorder()
 
@@ -106,7 +106,7 @@ func TestPlaceOrder_BezZagolovkaIdempotencyKey_400(t *testing.T) {
 func TestPlaceOrder_NovyZapros_201(t *testing.T) {
 	router, _ := newTestRouter()
 
-	req := httptest.NewRequest(http.MethodPost, "/orders",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/orders",
 		strings.NewReader(`{"buyer_id":1,"listing_id":"listing-1"}`))
 	req.Header.Set("Idempotency-Key", "key-1")
 	rec := httptest.NewRecorder()
@@ -124,7 +124,7 @@ func TestPlaceOrder_PovtorSGotovymOtvetom_TotZheZakaz(t *testing.T) {
 	router, _ := newTestRouter()
 
 	makeReq := func() *http.Request {
-		r := httptest.NewRequest(http.MethodPost, "/orders",
+		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/orders",
 			strings.NewReader(`{"buyer_id":1,"listing_id":"listing-1"}`))
 		r.Header.Set("Idempotency-Key", "key-1")
 		return r
@@ -149,7 +149,7 @@ func TestPlaceOrder_ParallelnyPovtor_409(t *testing.T) {
 	router, idem := newTestRouter()
 	idem.forceStatus["place-order:key-1"] = ports.IdempotencyInProgress
 
-	req := httptest.NewRequest(http.MethodPost, "/orders",
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/orders",
 		strings.NewReader(`{"buyer_id":1,"listing_id":"listing-1"}`))
 	req.Header.Set("Idempotency-Key", "key-1")
 	rec := httptest.NewRecorder()
@@ -162,7 +162,7 @@ func TestPlaceOrder_ParallelnyPovtor_409(t *testing.T) {
 func TestGetOrder_NeNayden_404(t *testing.T) {
 	router, _ := newTestRouter()
 
-	req := httptest.NewRequest(http.MethodGet, "/orders/unknown", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/orders/unknown", nil)
 	rec := httptest.NewRecorder()
 
 	router.ServeHTTP(rec, req)

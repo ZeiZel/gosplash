@@ -283,6 +283,32 @@ func toESDoc(doc domain.ListingDoc) esDoc {
 	}
 }
 
+// bulkIndexMeta/bulkDeleteMeta — метаданные одного действия _bulk (первая
+// строка NDJSON). Статические типы, а не map[string]any: карта сериализуется
+// через reflection с ПОСТРОЕНИЕМ И СОРТИРОВКОЙ ключей на каждом документе
+// пачки, структура же кодируется прямой записью полей. Поля объявлены в том
+// же порядке, в котором encoding/json сортировал бы ключи карты (_id,
+// _index, version, version_type), — провод остаётся байт-в-байт прежним,
+// что зафиксировано тестом TestBuildBulkBody_MetastrokiBaytVBajt.
+type bulkIndexMeta struct {
+	Index bulkActionMeta `json:"index"`
+}
+
+type bulkDeleteMeta struct {
+	Delete bulkActionMeta `json:"delete"`
+}
+
+type bulkActionMeta struct {
+	// _id без omitempty в ОБЕИХ операциях: и index, и delete адресуются
+	// конкретным документом (delete-by-query здесь не используется), пустой
+	// id обязан уехать на сервер как "_id":"" и быть там отвергнутым,
+	// а не исчезнуть из метаданных молча.
+	ID          string `json:"_id"`
+	Index       string `json:"_index"`
+	Version     int64  `json:"version"`
+	VersionType string `json:"version_type"`
+}
+
 // buildBulkBody собирает NDJSON-тело _bulk: две строки на index-действие
 // (метаданные + документ) и одна на delete (только метаданные — у удаления
 // нет тела). version/version_type=external_gte в метаданных КАЖДОГО
@@ -290,21 +316,29 @@ func toESDoc(doc domain.ListingDoc) esDoc {
 // app/indexer.go: Elasticsearch сам отбросит действие, если в индексе уже
 // лежит документ с версией не младше присланной.
 func buildBulkBody(index string, batch []bulkAction) ([]byte, error) {
+	// Эвристика предзапаса ~256 байт на действие (мета-строка + строка
+	// документа): спасает буфер от нескольких удвоений с копированиями на
+	// пачке; промах в любую сторону не ломает ничего — Grow лишь подсказка.
 	var buf bytes.Buffer
+	buf.Grow(len(batch) * 256)
+
 	for _, a := range batch {
+		meta := bulkActionMeta{
+			ID:          a.id,
+			Index:       index,
+			Version:     a.version,
+			VersionType: "external_gte",
+		}
+
 		op := "index"
+		var metaBytes []byte
+		var err error
 		if a.isDelete {
 			op = "delete"
+			metaBytes, err = json.Marshal(bulkDeleteMeta{Delete: meta})
+		} else {
+			metaBytes, err = json.Marshal(bulkIndexMeta{Index: meta})
 		}
-		meta := map[string]any{
-			op: map[string]any{
-				"_index":       index,
-				"_id":          a.id,
-				"version":      a.version,
-				"version_type": "external_gte",
-			},
-		}
-		metaBytes, err := json.Marshal(meta)
 		if err != nil {
 			return nil, fmt.Errorf("метаданные %s %s: %w", op, a.id, err)
 		}

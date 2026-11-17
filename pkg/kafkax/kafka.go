@@ -14,8 +14,10 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -141,7 +143,7 @@ func (p *Producer) Publish(ctx context.Context, topic string, env *eventsv1.Enve
 		span.SetStatus(otelcodes.Error, "produce failed")
 		return fmt.Errorf("produce в %s: %w", topic, err)
 	}
-	slog.Info("kafka →",
+	slog.InfoContext(ctx, "kafka →",
 		"topic", topic,
 		"partition", record.Partition,
 		"offset", record.Offset,
@@ -277,6 +279,28 @@ func NewConsumer(brokers []string, group, topic string) (*Consumer, error) {
 // retryable — это безопасный дефолт, а не молчаливое решение «как получится».
 type Handler func(ctx context.Context, env *eventsv1.Envelope) error
 
+// handleSafely вызывает Handler, превращая панику в ошибку, классифицированную
+// как Permanent (errors.go).
+//
+// Паника в обработчике — типичный источник «отравленных» записей: nil-поле
+// в payload, выход за границы слайса — и повторный вызов того же Handler
+// с теми же байтами упадёт так же. Отдавать такую запись в retry бессмысленно,
+// поэтому она уходит по общему permanent-пути в DLQ (dlq.go), а не убивает
+// весь процесс: одна битая запись не должна останавливать сервис, который
+// обрабатывает ещё тысячи нормальных. Если Handler вернулся штатно —
+// recover не срабатывает и поведение не меняется ни на йоту.
+func handleSafely(ctx context.Context, record *kgo.Record, handle Handler, env *eventsv1.Envelope) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "kafka ✗ паника в обработчике, сообщение уходит в DLQ",
+				"topic", record.Topic, "partition", record.Partition, "offset", record.Offset,
+				"panic", r, "stack", string(debug.Stack()))
+			err = Permanent(fmt.Errorf("паника в обработчике: %v", r))
+		}
+	}()
+	return handle(ctx, env)
+}
+
 // Run читает топик, пока не отменят ctx.
 //
 // Схема доставки получается at-least-once: сообщение обработается минимум
@@ -332,7 +356,14 @@ func (c *Consumer) Run(ctx context.Context, handle Handler) error {
 		}
 		if errs := fetches.Errors(); len(errs) > 0 {
 			c.client.AllowRebalance()
-			return fmt.Errorf("fetch: %w", errs[0].Err)
+			// Ошибок может быть несколько (по одной на партицию), и прятать
+			// все, кроме первой, — терять половину диагноза: видим «узел A
+			// недоступен», а в лог не попадает «узел B — тоже».
+			joined := make([]error, 0, len(errs))
+			for _, fe := range errs {
+				joined = append(joined, fe.Err)
+			}
+			return fmt.Errorf("fetch: %w", errors.Join(joined...))
 		}
 
 		engine.dispatch(fetches)
@@ -375,7 +406,7 @@ func (c *Consumer) processOne(ctx context.Context, record *kgo.Record, handle Ha
 
 	var lastErr error
 	for attempt := 1; attempt <= MaxRetryAttempts; attempt++ {
-		lastErr = handle(spanCtx, &env)
+		lastErr = handleSafely(spanCtx, record, handle, &env)
 		if lastErr == nil || isPermanent(lastErr) {
 			break
 		}
@@ -384,7 +415,20 @@ func (c *Consumer) processOne(ctx context.Context, record *kgo.Record, handle Ha
 			slog.WarnContext(spanCtx, "kafka: временная ошибка, повтор на месте",
 				"topic", record.Topic, "partition", record.Partition, "offset", record.Offset,
 				"attempt", attempt, "delay", delay, "error", lastErr)
-			time.Sleep(delay)
+			// Раньше здесь был time.Sleep: он не видит отмену ctx, и при
+			// остановке сервиса партиция (а с ней stopAll и Close) могла
+			// ждать до backoffCap=30с вместо немедленного выхода. Тот же
+			// паттерн таймера, что и в waitForRetryAt (retry.go).
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-spanCtx.Done():
+				timer.Stop()
+				// Offset не закоммичен — сообщение достанется следующему
+				// запуску (см. то же рассуждение в waitForRetryAt).
+				span.End()
+				return
+			}
 		}
 	}
 	elapsed := time.Since(started)
@@ -458,7 +502,7 @@ func (c *Consumer) commit(ctx context.Context, record *kgo.Record) {
 	cctx, cancel := detachedTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := c.client.CommitRecords(cctx, record); err != nil {
-		slog.Error("kafka ✗ commit", "error", err)
+		slog.ErrorContext(ctx, "kafka ✗ commit", "error", err)
 	}
 }
 

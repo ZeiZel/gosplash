@@ -38,6 +38,12 @@ func (OrderRow) TableName() string { return "orders" }
 // IdempotencyKeyRow — fallback-таблица HTTP idempotency-key. См.
 // internal/adapters/idempotency и docs/adr/0018-idempotency-http.md:
 // Redis здесь быстрый путь, эта таблица — источник правды.
+//
+// CreatedAt — ЭПОХА ЗАНЯТИЯ ключа, а не «время рождения строки навсегда»:
+// перезанятие протухшего in_progress (beginPG) обновляет created_at,
+// потому что именно по нему считается возраст занятия для TTL. UpdatedAt —
+// момент последней смены статуса (занятие/перезанятие/Complete), по нему
+// чистка удаляет завершённые строки.
 type IdempotencyKeyRow struct {
 	Key      string `gorm:"column:key;primaryKey"`
 	Status   string `gorm:"column:status;not null"`

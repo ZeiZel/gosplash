@@ -51,7 +51,7 @@ func TestParseRetryAt_OtsutstvuetIliBitOznachaetSeychas(t *testing.T) {
 	// time.Time{} (нулевое значение) — заведомо в прошлом относительно
 	// time.Now(), поэтому time.Until(...) для него всегда отрицательно,
 	// и вызывающий код (RetryConsumer.processOne) трактует это как «пора».
-	assert.True(t, time.Until(parseRetryAt(noHeader)) < 0)
+	assert.Negative(t, time.Until(parseRetryAt(noHeader)))
 }
 
 func TestRetryRound_NolPoUmolchaniyu(t *testing.T) {

@@ -12,6 +12,7 @@ package domain
 import (
 	"errors"
 	"math"
+	"strconv"
 )
 
 // Ошибки домена. internal/adapters переводят их в свой язык: adapters/kafka
@@ -71,32 +72,7 @@ func SizeLabel(index int) string {
 	if index >= 0 && index < len(SizeLabels) {
 		return SizeLabels[index]
 	}
-	return "size" + itoa(index+1)
-}
-
-// itoa — не strconv.Itoa ради экономии импорта: это единственное место
-// в пакете, где вообще нужно превратить число в строку, и то только
-// в ветке, которая при штатной конфигурации (3 размера) не выполняется.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
+	return "size" + strconv.Itoa(index+1)
 }
 
 // Thumbnail — одно готовое превью фото.
@@ -147,10 +123,7 @@ func FitLongSide(origW, origH, target int) (width, height int) {
 		return origW, origH
 	}
 
-	longSide := origW
-	if origH > longSide {
-		longSide = origH
-	}
+	longSide := max(origW, origH)
 	if target >= longSide {
 		return origW, origH
 	}

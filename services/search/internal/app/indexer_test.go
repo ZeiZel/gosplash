@@ -116,7 +116,7 @@ func TestIndexer_HandleListingPublished_BitiyPayload(t *testing.T) {
 
 	err := indexer.HandleListingPublished(context.Background(), env)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, kafkax.ErrPermanent),
+	assert.ErrorIs(t, err, kafkax.ErrPermanent,
 		"битый payload обязан классифицироваться как permanent, повтор его не починит")
 	assert.Equal(t, 0, writer.indexCalls)
 	assert.Equal(t, 0, writer.deleteCalls)
@@ -165,5 +165,5 @@ func TestIndexer_HandleListingPublished_OshibkiPishutsyaCherezClassify(t *testin
 
 	err := indexer.HandleListingPublished(context.Background(), env)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, kafkax.ErrPermanent))
+	assert.ErrorIs(t, err, kafkax.ErrPermanent)
 }

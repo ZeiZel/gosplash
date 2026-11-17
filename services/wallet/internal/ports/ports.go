@@ -52,7 +52,26 @@ type WalletStore interface {
 // *gorm.DB-tx, переданном в fn у WithinTx — иначе гарантия атомарности,
 // на которой держится вся идемпотентность и парность проводок, превращается
 // в фикцию.
+//
+// НЕОЧЕВИДНОЕ РЕШЕНИЕ: TxStore собран композицией маленьких ролевых
+// интерфейсов ниже (AccountTx, ReservationTx, LedgerTx, OperationTx,
+// OutboxTx), а не одним плоским списком методов. Роли сгруппированы по
+// сущностям, которых касается метод: так по сигнатуре fn внутри WithinTx
+// видно, КАКУЮ часть хранилища трогает каждый сценарий, даже не открывая
+// его код. Набор методов TxStore при этом ровно тот же, что был до
+// группировки, поэтому ни реализация (adapters/pg), ни тестовая подделка
+// (app/store_fake_test.go) от рефакторинга не меняются.
 type TxStore interface {
+	AccountTx
+	ReservationTx
+	LedgerTx
+	OperationTx
+	OutboxTx
+}
+
+// AccountTx — счёт как строка таблицы: блокировка на время денежной
+// операции и ничего сверх неё.
+type AccountTx interface {
 	// LockAccount читает счёт с блокировкой строки (SELECT ... FOR UPDATE).
 	//
 	// Без блокировки два конкурентных ReserveFunds на один и тот же счёт
@@ -61,10 +80,11 @@ type TxStore interface {
 	// чем реально доступно. FOR UPDATE сериализует такие вызовы: второй
 	// дождётся коммита первого и увидит уже актуальный available.
 	LockAccount(ctx context.Context, accountID int64) (*domain.Account, error)
+}
 
-	// LedgerBalance — сумма проводок по счёту (кредит минус дебет).
-	LedgerBalance(ctx context.Context, accountID int64) (int64, error)
-
+// ReservationTx — резервы: идемпотентное создание, блокировка, смена
+// статуса и сумма активных.
+type ReservationTx interface {
 	// ActiveReservedSum — сумма активных резервов по счёту.
 	ActiveReservedSum(ctx context.Context, accountID int64) (int64, error)
 
@@ -89,10 +109,17 @@ type TxStore interface {
 
 	// SetReservationStatus переводит резерв в committed/released.
 	SetReservationStatus(ctx context.Context, reservationID, status string) error
+}
+
+// LedgerTx — append-only книга проводок: агрегатные чтения и вставка
+// проводок ПАРАМИ (см. заголовок пакета domain).
+type LedgerTx interface {
+	// LedgerBalance — сумма проводок по счёту (кредит минус дебет).
+	LedgerBalance(ctx context.Context, accountID int64) (int64, error)
 
 	// InsertLedgerEntries вставляет ОБЕ проводки операции одним вызовом —
 	// оператор обязан передать их парой (или большим согласованным набором,
-	// но не единственной проводкой без пары), чтобы инвариант «сумма равна
+	// но не единичной проводкой без пары), чтобы инвариант «сумма равна
 	// нулю» никогда не нарушался даже посередине выполнения (см. заголовок
 	// пакета domain).
 	InsertLedgerEntries(ctx context.Context, entries []*domain.LedgerEntry) error
@@ -103,7 +130,11 @@ type TxStore interface {
 	// internal/app/service.go): вернуть надо именно те проводки, что были
 	// созданы раньше, а не создавать новые.
 	LedgerEntryIDsByReference(ctx context.Context, referenceID string) ([]string, error)
+}
 
+// OperationTx — журнал уже выполненных Commit/Release (идемпотентность
+// операций без своей unique-строки).
+type OperationTx interface {
 	// FindOperation / RecordOperation — идемпотентность CommitFunds и
 	// ReleaseFunds. У них нет своей строки с unique-ключом, как у резерва
 	// (они МЕНЯЮТ уже существующую сущность, а не создают новую), поэтому
@@ -113,7 +144,11 @@ type TxStore interface {
 	// InsertReservation.
 	FindOperation(ctx context.Context, key, kind string) (resultJSON []byte, found bool, err error)
 	RecordOperation(ctx context.Context, key, kind, reservationID string, resultJSON []byte) (recorded bool, err error)
+}
 
+// OutboxTx — запись в transactional outbox из той же транзакции, что
+// и проводки.
+type OutboxTx interface {
 	// WriteAccountDebited — PATTERN: transactional outbox (pkg/outbox).
 	// Событие пишется в ТОЙ ЖЕ транзакции, что и проводки: иначе окно между
 	// коммитом проводок и публикацией события — то самое место, где процесс

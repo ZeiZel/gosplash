@@ -192,7 +192,7 @@ func TestHandlePhotoUploaded_MediaNedostupna_Retryable(t *testing.T) {
 	err := indexer.HandlePhotoUploaded(context.Background(), env)
 
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, kafkax.ErrRetryable), "недоступность media — временная ошибка")
+	assert.ErrorIs(t, err, kafkax.ErrRetryable, "недоступность media — временная ошибка")
 	assert.Empty(t, tx.upserted)
 	assert.False(t, uow.claimed[env.GetEventId()], "Claim обязан откатиться вместе с бизнес-ошибкой")
 
@@ -216,7 +216,7 @@ func TestHandlePhotoUploaded_FotoNeSuschestvuet_Permanent(t *testing.T) {
 	err := indexer.HandlePhotoUploaded(context.Background(), uploadedEnvelope(t, "photo-1", 42))
 
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, kafkax.ErrPermanent), "несуществующее фото — постоянная ошибка, повтор не поможет")
+	assert.ErrorIs(t, err, kafkax.ErrPermanent, "несуществующее фото — постоянная ошибка, повтор не поможет")
 	assert.Empty(t, tx.upserted)
 }
 
@@ -238,7 +238,7 @@ func TestHandlePhotoUploaded_BituyPayload_Permanent(t *testing.T) {
 	handleErr := indexer.HandlePhotoUploaded(context.Background(), broken)
 
 	require.Error(t, handleErr)
-	assert.True(t, errors.Is(handleErr, kafkax.ErrPermanent))
+	assert.ErrorIs(t, handleErr, kafkax.ErrPermanent)
 	assert.Zero(t, media.calls, "до похода в media дело не должно дойти")
 	assert.Empty(t, tx.upserted)
 }
@@ -273,7 +273,7 @@ func TestHandlePhotoThumbnailReady_KartochkaEschoNeSozdana_Retryable(t *testing.
 	err := indexer.HandlePhotoThumbnailReady(context.Background(), env)
 
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, kafkax.ErrRetryable))
+	assert.ErrorIs(t, err, kafkax.ErrRetryable)
 	assert.Empty(t, cache.invalidated, "инвалидация не должна случиться, пока применение не удалось")
 }
 
@@ -287,7 +287,7 @@ func TestHandlePhotoThumbnailReady_BituyPayload_Permanent(t *testing.T) {
 
 	handleErr := indexer.HandlePhotoThumbnailReady(context.Background(), broken)
 	require.Error(t, handleErr)
-	assert.True(t, errors.Is(handleErr, kafkax.ErrPermanent))
+	assert.ErrorIs(t, handleErr, kafkax.ErrPermanent)
 }
 
 func TestHandlePhotoThumbnailReady_PovtornoeSobytieNePrimenyaetsyaDvazhdy(t *testing.T) {

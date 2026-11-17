@@ -106,15 +106,17 @@ func allowedByMarker(f *file, callLine int) (reason string, ok bool) {
 	for _, cg := range f.ast.Comments {
 		for _, c := range cg.List {
 			text := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(c.Text, "//"), "/*"), "*/")
-			idx := strings.Index(text, marker)
-			if idx < 0 {
+			// Cut, а не Index+срез: маркер может стоять в любом месте
+			// комментария, а причина — это всё, что после него.
+			_, reason, found := strings.Cut(text, marker)
+			if !found {
 				continue
 			}
 			line := f.fset.Position(c.Pos()).Line
 			if line != callLine && line != callLine-1 {
 				continue
 			}
-			reason = strings.TrimSpace(text[idx+len(marker):])
+			reason = strings.TrimSpace(reason)
 			if reason == "" {
 				continue
 			}

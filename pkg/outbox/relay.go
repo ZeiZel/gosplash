@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,6 +43,12 @@ import (
 type shard struct {
 	index int
 	pool  *pgxpool.Pool
+
+	// lastCleanup — когда на этом шарде последний раз бегала чистка
+	// (maybeCleanup). Своё поле, а не общий на Relay счётчик: шарды
+	// независимы, и «шард A чистился только что» не должно отменять
+	// чистку шарда B. Читается и пишется только из горутины Run.
+	lastCleanup time.Time
 }
 
 // Relay — фоновый процесс, публикующий накопленные в outbox события.
@@ -69,7 +76,25 @@ func New(cfg Config) (*Relay, error) {
 	r := &Relay{cfg: cfg}
 
 	for i, dsn := range cfg.DSNs {
-		pool, err := pgxpool.New(context.Background(), dsn)
+		// Явные лимиты пула — обещание docs/adr/0006 (раздел «Последствия»):
+		// пул relay живёт в том же процессе, что и GORM-пул на ту же базу,
+		// и max_connections PostgreSQL можно осознанно считать, только видя
+		// ОБА. Relay'ю хватает двух соединений на шард: это одиночный цикл
+		// «выбрать батч → опубликовать → пометить» с одним писателем в
+		// таблицу, а не GORM'овский пул, который держит запас под десятки
+		// параллельных HTTP-запросов. Дефолт pgxpool при этом привязан
+		// к числу CPU и на большой машине незаметно съел бы заметную долю
+		// max_connections впустую.
+		poolCfg, err := pgxpool.ParseConfig(dsn)
+		if err != nil {
+			r.Close()
+			return nil, fmt.Errorf("outbox: relay: шард %d: %w", i, err)
+		}
+		poolCfg.MaxConns = 2
+		poolCfg.MinConns = 1
+		poolCfg.MaxConnLifetime = 30 * time.Minute
+		poolCfg.MaxConnIdleTime = 5 * time.Minute
+		pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 		if err != nil {
 			r.Close()
 			return nil, fmt.Errorf("outbox: relay: шард %d: %w", i, err)
@@ -168,9 +193,11 @@ func (r *Relay) Run(ctx context.Context) error {
 // обход шардов; при двух-трёх шардах это несущественно, при десятках —
 // уже стоило бы распараллелить (не делаем: нет цифр, см. ADR 0006).
 func (r *Relay) pollAllShards(ctx context.Context) {
-	for _, s := range r.shards {
-		if err := r.pollShard(ctx, s); err != nil {
-			slog.Error("outbox: relay: шард", "shard", s.index, "error", err)
+	// По указателю, а не по значению: pollShard пишет в shard.lastCleanup
+	// (счётчик чистки), и запись в копию терялась бы на каждой итерации.
+	for i := range r.shards {
+		if err := r.pollShard(ctx, &r.shards[i]); err != nil {
+			slog.ErrorContext(ctx, "outbox: relay: шард", "shard", r.shards[i].index, "error", err)
 		}
 	}
 }
@@ -185,16 +212,16 @@ type batchRow struct {
 
 // pollShard — одна итерация: снять метрику, выбрать батч, опубликовать,
 // пометить опубликованное.
-func (r *Relay) pollShard(ctx context.Context, s shard) error {
+func (r *Relay) pollShard(ctx context.Context, s *shard) error {
 	// Имя таблицы подставляется в SQL СТРОКОЙ, а не параметром: параметры
 	// бывают только у значений, не у идентификаторов. Это безопасно ровно
 	// потому, что значение приходит не от пользователя, а из TableFor()
 	// поверх имени сервиса, заданного в main.go при старте.
 	table := TableFor(r.cfg.ServiceName)
 
-	if err := r.reportPending(ctx, s); err != nil {
+	if err := r.reportPending(ctx, *s); err != nil {
 		// Метрика — не повод останавливать публикацию, поэтому только лог.
-		slog.Warn("outbox: relay: outbox_pending", "shard", s.index, "error", err)
+		slog.WarnContext(ctx, "outbox: relay: outbox_pending", "shard", s.index, "error", err)
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -219,7 +246,9 @@ func (r *Relay) pollShard(ctx context.Context, s shard) error {
 		return fmt.Errorf("select: %w", err)
 	}
 
-	var batch []batchRow
+	// LIMIT в SELECT выше известен заранее — сразу закладываем ёмкость
+	// под весь батч, чтобы append не перераспределял слайс по мере роста.
+	batch := make([]batchRow, 0, r.cfg.BatchSize)
 	for rows.Next() {
 		var row batchRow
 		var aggregateID string
@@ -253,13 +282,66 @@ func (r *Relay) pollShard(ctx context.Context, s shard) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 
-	slog.Info("outbox: relay опубликовал батч",
+	slog.InfoContext(ctx, "outbox: relay опубликовал батч",
 		"shard", s.index, "published", len(published), "batch", len(batch))
 	if len(published) < len(batch) {
-		slog.Warn("outbox: relay: часть батча не опубликована, останется в очереди",
+		slog.WarnContext(ctx, "outbox: relay: часть батча не опубликована, останется в очереди",
 			"shard", s.index, "failed", len(batch)-len(published))
 	}
+
+	// Чистка — только после УСПЕШНОГО коммита батча: неудачный тик не должен
+	// тратить соединение на DELETE, который и без того повторится позже.
+	r.maybeCleanup(ctx, s)
 	return nil
+}
+
+// maybeCleanup изредка (не чаще CleanupInterval) удаляет опубликованные
+// строки старше Retention.
+//
+// Таблица outbox иначе растёт бесконечно: бизнес-код в неё только вставляет,
+// а «опубликованная строка» никому больше не нужна — событие уже в Kafka,
+// и вернуться к нему можно из самого брокера (DLQ, tools/kafka-reprocess).
+// Раньше чистка числилась обязанностью вызывающего сервиса (cron), но её
+// никто не делал; теперь она здесь — у процесса, который и создаёт этот
+// рост. DELETE идёт мимо транзакции батча: одиночный оператор атомарен сам
+// по себе, и держать ради него лишнее соединение незачем.
+//
+// Ошибка чистки не падает на вызывающего: неудачный DELETE — не повод
+// останавливать публикацию, следующая попытка будет не раньше
+// CleanupInterval (отсчёт ставится ДО попытки — «не чаще», а не «пока
+// не получится»).
+func (r *Relay) maybeCleanup(ctx context.Context, s *shard) {
+	if r.cfg.Retention <= 0 {
+		return // чистка выключена конфигурацией (Config.Retention)
+	}
+	now := time.Now()
+	if !cleanupDue(now, s.lastCleanup, r.cfg.CleanupInterval) {
+		return
+	}
+	s.lastCleanup = now
+
+	// Порог считаем на стороне приложения, а не «now() - $1» в SQL: pgx не
+	// кодирует time.Duration в interval, а расхождение часов с базой на
+	// секунды не имеет значения при пороге в дни.
+	cutoff := now.Add(-r.cfg.Retention)
+	tag, err := s.pool.Exec(ctx, `DELETE FROM `+TableFor(r.cfg.ServiceName)+` WHERE published_at < $1`, cutoff)
+	if err != nil {
+		slog.WarnContext(ctx, "outbox: relay: чистка не удалась, повторю позже",
+			"shard", s.index, "error", err)
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		slog.InfoContext(ctx, "outbox: relay: удалены устаревшие строки",
+			"shard", s.index, "deleted", n, "retention", r.cfg.Retention)
+	}
+}
+
+// cleanupDue — пора ли чистить. Вынесено в чистую функцию ради unit-теста
+// без Postgres: механика «не чаще раза в интервал» — ровно то, что легко
+// сломать рефакторингом, а проверять её через настоящий DELETE дорогого
+// стоит (нужен Docker, см. relay_integration_test.go).
+func cleanupDue(now, lastCleanup time.Time, interval time.Duration) bool {
+	return now.Sub(lastCleanup) >= interval
 }
 
 // publishBatch публикует строки батча ПОСЛЕДОВАТЕЛЬНО и синхронно.
@@ -275,7 +357,7 @@ func (r *Relay) publishBatch(ctx context.Context, batch []batchRow) []string {
 	for _, row := range batch {
 		headers, err := headersToRecordHeaders(row.headers)
 		if err != nil {
-			slog.Error("outbox: relay: битые headers в строке, публикую без них",
+			slog.ErrorContext(ctx, "outbox: relay: битые headers в строке, публикую без них",
 				"id", row.id, "error", err)
 		}
 		// producer проставлен ещё в Write — тем сервисом, который событие
@@ -288,7 +370,7 @@ func (r *Relay) publishBatch(ctx context.Context, batch []batchRow) []string {
 
 		record := &kgo.Record{Topic: row.topic, Key: row.key, Value: row.payload, Headers: headers}
 		if err := r.producer.ProduceSync(ctx, record).FirstErr(); err != nil {
-			slog.Error("outbox: relay: produce не удался, строка останется в очереди",
+			slog.ErrorContext(ctx, "outbox: relay: produce не удался, строка останется в очереди",
 				"id", row.id, "topic", row.topic, "error", err)
 			continue
 		}
@@ -329,10 +411,5 @@ func (r *Relay) reportPending(ctx context.Context, s shard) error {
 // hasHeader — есть ли уже такой заголовок. Нужен, чтобы relay не перетирал
 // атрибуцию, проставленную при записи в outbox.
 func hasHeader(headers []kgo.RecordHeader, key string) bool {
-	for _, h := range headers {
-		if h.Key == key {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(headers, func(h kgo.RecordHeader) bool { return h.Key == key })
 }

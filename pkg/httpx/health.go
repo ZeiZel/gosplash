@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"sync"
 	"time"
@@ -65,9 +66,7 @@ func (h *Health) Handle(router *http.ServeMux, serviceName string) {
 		h.mu.RLock()
 		ready := h.ready
 		checks := make(map[string]Check, len(h.checks))
-		for name, check := range h.checks {
-			checks[name] = check
-		}
+		maps.Copy(checks, h.checks)
 		h.mu.RUnlock()
 
 		// Общий бюджет на все проверки. Без него readiness-пробу можно

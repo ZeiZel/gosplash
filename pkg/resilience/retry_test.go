@@ -129,7 +129,7 @@ func TestRetrier_ZaderzhkiRastutIImeyutRazbros(t *testing.T) {
 	// Внутри одного attempt значения не должны все совпадать — иначе это
 	// не jitter, а замаскированная константа.
 	seen := make(map[time.Duration]bool, samples)
-	for i := 0; i < samples; i++ {
+	for range samples {
 		d := fullJitterDelay(cfg, 0)
 		assert.GreaterOrEqual(t, d, time.Duration(0))
 		assert.Less(t, d, cfg.BaseDelay, "full jitter не должен превышать верхнюю границу backoff")
@@ -142,7 +142,7 @@ func TestRetrier_ZaderzhkiRastutIImeyutRazbros(t *testing.T) {
 	// они должны расти (пока не упрутся в MaxDelay).
 	maxAt := func(attempt int) time.Duration {
 		var max time.Duration
-		for i := 0; i < samples; i++ {
+		for range samples {
 			if d := fullJitterDelay(cfg, attempt); d > max {
 				max = d
 			}
@@ -155,7 +155,7 @@ func TestRetrier_ZaderzhkiRastutIImeyutRazbros(t *testing.T) {
 	assert.Greater(t, max3, max0, "окно задержки на attempt=3 должно быть шире, чем на attempt=0")
 
 	// MaxDelay — потолок: на большом attempt окно не улетает за него.
-	for i := 0; i < samples; i++ {
+	for range samples {
 		d := fullJitterDelay(cfg, 20)
 		assert.LessOrEqual(t, d, cfg.MaxDelay)
 	}

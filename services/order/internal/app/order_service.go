@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/google/uuid"
+	"uuid"
 
 	eventsv1 "gosplash/gen/go/gosplash/events/v1"
 	"gosplash/pkg/kafkax"
@@ -89,7 +89,9 @@ func (s *OrderService) PlaceOrder(ctx context.Context, cmd PlaceOrderCommand) (*
 	}
 
 	order := &domain.Order{
-		ID:         uuid.NewString(),
+		// stdlib uuid вместо github.com/google/uuid: v4-идентификатор
+		// заказа, как и раньше (NewString был ровно им).
+		ID:         uuid.NewV4().String(),
 		BuyerID:    cmd.BuyerID,
 		ListingID:  cmd.ListingID,
 		PriceCents: listing.PriceCents,

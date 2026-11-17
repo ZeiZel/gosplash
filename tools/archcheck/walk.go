@@ -86,7 +86,7 @@ func collectFiles(root string) ([]*file, error) {
 			// не архитектурных правил. Не роняем весь обход из-за одного
 			// битого файла (например, временно недописанного во время
 			// правки кем-то ещё).
-			return nil
+			return nil //nolint:nilerr // пропуск непарсящегося файла — осознанное решение (см. комментарий выше)
 		}
 		files = append(files, &file{relPath: rel, fset: fset, ast: astFile})
 		return nil

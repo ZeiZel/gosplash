@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"gorm.io/gorm"
@@ -129,9 +130,7 @@ func (t *indexTx) ApplyThumbnails(ctx context.Context, photoID string, thumbnail
 	if err != nil {
 		return nil, err
 	}
-	for size, key := range thumbnails {
-		existing[size] = key
-	}
+	maps.Copy(existing, thumbnails)
 	merged, err := marshalThumbnails(existing)
 	if err != nil {
 		return nil, err
@@ -153,8 +152,19 @@ func (t *indexTx) ApplyThumbnails(ctx context.Context, photoID string, thumbnail
 
 	var author AuthorSnapshotRow
 	authorName := ""
-	if err := t.tx.WithContext(ctx).Where("id = ?", row.AuthorID).First(&author).Error; err == nil {
+	// «Строки нет» и «БД сломалась» — разные исходы, и раньше они не
+	// различались: ANY error молча превращался в пустое имя автора.
+	// NotFound — штатный случай (снапшот автора ещё не записан первым
+	// UpsertAuthorSnapshot'ом), имя остаётся заглушкой; любая другая
+	// ошибка — реальный сбой БД, прятать её значило бы публиковать карточку
+	// с именем-заглушкой без следа в логах.
+	switch err := t.tx.WithContext(ctx).Where("id = ?", row.AuthorID).First(&author).Error; {
+	case err == nil:
 		authorName = author.Name
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// автора ещё нет в снапшотах — пустое имя, заглушка подставится ниже
+	default:
+		return nil, fmt.Errorf("чтение снапшота автора: %w", err)
 	}
 	return toDomain(&row, authorName)
 }

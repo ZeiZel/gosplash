@@ -2,6 +2,7 @@ package bootstrap_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,9 +36,16 @@ func (r *fakeRelay) Ping(context.Context) error { return nil }
 // Postgres. NewApp сам в БД не ходит (только оборачивает *gorm.DB в
 // репозиторий), поэтому для проверки сборки и остановки App годится любая
 // живая GORM-база, а поднимать ради этого контейнер с Postgres незачем.
+//
+// Сборка без CGO (CGO_ENABLED=0) получает от mattn/go-sqlite3 заглушку
+// вместо драйвера — тесты про сборку App, а не про sqlite, поэтому
+// в таком окружении они пропускаются, а не падают.
 func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil && strings.Contains(err.Error(), "requires cgo") {
+		t.Skip("sqlite недоступен: сборка без CGO (mattn/go-sqlite3 требует cgo)")
+	}
 	require.NoError(t, err, "sqlite в памяти обязана открыться без ошибок")
 	return db
 }

@@ -54,6 +54,51 @@ func TestPartitionEngine_DispatchBezVorkeraNePadaet(t *testing.T) {
 	})
 }
 
+// TestPartitionEngine_DispatchNeVisetNaPolnomKanalePriOtmeneCtx — регрессия:
+// раньше отправка в канал воркера была безусловной. Если воркер застрял
+// (backoff внутри processOne) и буфер канала (4 батча) полон, dispatch
+// зависал ДО прибытия следующего PollFetches — вместе с ним зависал
+// AllowRebalance, а значит и весь graceful shutdown. С отменённым ctx
+// dispatch обязан вернуться сразу: запись не теряется, offset не закоммичен.
+func TestPartitionEngine_DispatchNeVisetNaPolnomKanalePriOtmeneCtx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	release := make(chan struct{})
+	engine := newPartitionEngine(ctx, func(context.Context, *kgo.Record) {
+		<-release // имитируем застрявшую обработку: канал копится
+	})
+	engine.assigned(context.Background(), nil, map[string][]int32{"t": {0}})
+	defer engine.stopAll()
+
+	engine.mu.Lock()
+	w := engine.workers[tp{"t", 0}]
+	engine.mu.Unlock()
+
+	// Буфер канала — 4 батча, плюс один «в работе» у застрявшего воркера:
+	// после пяти dispatch канал полон при любом interleaving горутин.
+	for range 5 {
+		engine.dispatch(fetchesOf("t", 0, &kgo.Record{Partition: 0}))
+	}
+	require.Eventually(t, func() bool {
+		return len(w.recs) == cap(w.recs)
+	}, time.Second, time.Millisecond, "буфер канала воркера должен заполниться")
+
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		// Шестая отправка: без select на ctx.Done висела бы вечно.
+		engine.dispatch(fetchesOf("t", 0, &kgo.Record{Partition: 0}))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatch заблокировался на полном канале при уже отменённом ctx")
+	}
+
+	close(release)
+}
+
 func TestPartitionEngine_RevokedZhdyotZaversheniyaVorkerov(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})

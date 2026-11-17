@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"gosplash/services/wallet/internal/domain"
@@ -120,17 +121,11 @@ type fakeSnapshot struct {
 
 func (f *fakeStore) snapshot() fakeSnapshot {
 	reservations := make(map[string]*domain.Reservation, len(f.reservations))
-	for k, v := range f.reservations {
-		reservations[k] = v
-	}
+	maps.Copy(reservations, f.reservations)
 	byKey := make(map[string]string, len(f.reservationByKey))
-	for k, v := range f.reservationByKey {
-		byKey[k] = v
-	}
+	maps.Copy(byKey, f.reservationByKey)
 	ops := make(map[string]*fakeOperation, len(f.operations))
-	for k, v := range f.operations {
-		ops[k] = v
-	}
+	maps.Copy(ops, f.operations)
 	return fakeSnapshot{
 		ledgerLen:        len(f.ledger),
 		debitedLen:       len(f.debitedEvents),

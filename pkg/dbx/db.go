@@ -56,11 +56,15 @@ func Open(dsn string) (*gorm.DB, error) {
 
 	sqlDB, err := gdb.DB()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dbx: получение *sql.DB из gorm: %w", err)
 	}
 	sqlDB.SetMaxOpenConns(20)
 	sqlDB.SetMaxIdleConns(5)
 	sqlDB.SetConnMaxLifetime(time.Hour)
+	// Простоявшее соединение закрываем сами, не дожидаясь, пока его оборвёт
+	// сервер или балансировщик: «мёртвое» соединение в пуле — это гарантированная
+	// ошибка первого же запроса после долгой тишины.
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 
 	return gdb, nil
 }

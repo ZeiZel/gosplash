@@ -65,7 +65,12 @@ func TestRelay_PadenieMezhduProduceIUpdateNeTeryayetSobytie(t *testing.T) {
 
 	gdb, err := gorm.Open(gormpostgres.Open(dsn))
 	require.NoError(t, err)
-	require.NoError(t, gdb.AutoMigrate(&OutboxRow{}))
+	// Таблица у каждого сервиса своя (TableFor) — создаём её путём
+	// продакшена (Migrate из migrations/auto.go), а не голым AutoMigrate
+	// дефолтного имени «outbox»: relay ниже будет читать именно служебную
+	// таблицу этого сервиса.
+	const serviceName = "media-test"
+	require.NoError(t, Migrate(gdb, serviceName))
 
 	const topic = "media.photo.uploaded"
 	env, err := kafkax.NewEnvelope(kafkax.EventPhotoUploaded, "photo-outbox-1", &eventsv1.PhotoUploaded{
@@ -79,11 +84,11 @@ func TestRelay_PadenieMezhduProduceIUpdateNeTeryayetSobytie(t *testing.T) {
 	// для теста самого outbox она не нужна, важна только атомарность
 	// с ЧЕМ-ТО, а Write работает одинаково независимо от соседа по tx.
 	require.NoError(t, gdb.Transaction(func(tx *gorm.DB) error {
-		return Write(ctx, tx, env, topic)
+		return Write(ctx, tx, serviceName, env, topic)
 	}))
 
 	relay, err := New(Config{
-		ServiceName: "media-test",
+		ServiceName: serviceName,
 		Brokers:     brokers,
 		DSNs:        []string{dsn},
 		BatchSize:   10,
@@ -95,7 +100,7 @@ func TestRelay_PadenieMezhduProduceIUpdateNeTeryayetSobytie(t *testing.T) {
 	simulateCrashAfterProduce(ctx, t, relay)
 
 	var row OutboxRow
-	require.NoError(t, gdb.Where("aggregate_id = ?", env.GetAggregateId()).First(&row).Error)
+	require.NoError(t, gdb.Table(TableFor(serviceName)).Where("aggregate_id = ?", env.GetAggregateId()).First(&row).Error)
 	require.Nil(t, row.PublishedAt, "после имитации падения строка обязана остаться неопубликованной")
 
 	// Шаг 3 — обычная работа relay: строка ещё не published (предыдущий
@@ -103,7 +108,7 @@ func TestRelay_PadenieMezhduProduceIUpdateNeTeryayetSobytie(t *testing.T) {
 	// и она уйдёт в Kafka повторно.
 	relay.pollAllShards(ctx)
 
-	require.NoError(t, gdb.Where("aggregate_id = ?", env.GetAggregateId()).First(&row).Error)
+	require.NoError(t, gdb.Table(TableFor(serviceName)).Where("aggregate_id = ?", env.GetAggregateId()).First(&row).Error)
 	require.NotNil(t, row.PublishedAt, "после штатного прохода relay строка обязана быть помечена опубликованной")
 
 	// Шаг 4 — читаем Kafka и проверяем оба свойства теста.
@@ -159,9 +164,11 @@ func simulateCrashAfterProduce(ctx context.Context, t *testing.T, relay *Relay) 
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback(ctx) }() // "падение" — откатываем вместо commit
 
+	// Имя таблицы — то же, что читает relay (TableFor от ServiceName), а не
+	// зашитое «outbox»: таблицы у каждого сервиса свои.
 	rows, err := tx.Query(ctx, `
 		SELECT id, aggregate_id, topic, key, headers, payload
-		FROM outbox
+		FROM `+TableFor(relay.cfg.ServiceName)+`
 		WHERE published_at IS NULL
 		ORDER BY id
 		LIMIT $1

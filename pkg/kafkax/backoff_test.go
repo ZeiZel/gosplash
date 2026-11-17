@@ -11,7 +11,7 @@ func TestBackoff_VGranicah(t *testing.T) {
 	// Свойство, а не конкретное значение (docs/STYLE.md): при полном jitter
 	// результат случаен, но обязан укладываться в [0, потолок экспоненты].
 	for attempt := 1; attempt <= 10; attempt++ {
-		for i := 0; i < 50; i++ {
+		for range 50 {
 			d := Backoff(attempt)
 			assert.GreaterOrEqual(t, d, time.Duration(0))
 			assert.LessOrEqual(t, d, backoffCap)
@@ -20,7 +20,7 @@ func TestBackoff_VGranicah(t *testing.T) {
 }
 
 func TestBackoff_AttemptMenshe1TrakuyetsyaKakPervaya(t *testing.T) {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		d := Backoff(0)
 		assert.LessOrEqual(t, d, backoffBase, "Backoff(0) должен вести себя как Backoff(1)")
 		d = Backoff(-5)
@@ -34,7 +34,7 @@ func TestBackoff_RastyotSPopytkami(t *testing.T) {
 	// сам Backoff случаен (полный jitter).
 	maxOf := func(attempt int, n int) time.Duration {
 		var max time.Duration
-		for i := 0; i < n; i++ {
+		for range n {
 			if d := Backoff(attempt); d > max {
 				max = d
 			}
@@ -48,7 +48,7 @@ func TestBackoff_RastyotSPopytkami(t *testing.T) {
 }
 
 func TestBackoff_UpiraetsyaVPotolok(t *testing.T) {
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		d := Backoff(30) // заведомо за пределами разумной экспоненты
 		assert.LessOrEqual(t, d, backoffCap)
 	}

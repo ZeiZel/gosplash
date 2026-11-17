@@ -54,6 +54,34 @@ func TestToStatus(t *testing.T) {
 	}
 }
 
+func TestToStatus_NeUtekaetTekstNeopoznannoyOshibkiKlientu(t *testing.T) {
+	// CWE-209: текст неопознанной ошибки может содержать детали
+	// инфраструктуры (DSN, SQL, пути), поэтому в default-ветке клиент
+	// получает статическое сообщение, а не оригинал.
+	secret := errors.New("connection refused: postgres://gosplash:pa$$w0rd@shard-1:5432")
+
+	got := ToStatus(secret, "PHOTO_GET_FAILED")
+
+	require.Error(t, got)
+	st, ok := status.FromError(got)
+	require.True(t, ok)
+	assert.Equal(t, codes.Internal, st.Code())
+	assert.Equal(t, "внутренняя ошибка сервера", st.Message())
+	assert.NotContains(t, st.Message(), "pa$$w0rd",
+		"текст неопознанной ошибки не должен доезжать до клиента")
+}
+
+func TestToStatus_DomennayaOshibkaSohranyaetTekst(t *testing.T) {
+	// Узнаваемая доменная ошибка — не утечка: её текст пишется человеком
+	// намеренно и адресован клиенту, подменять его статикой нельзя.
+	got := ToStatus(&domainErr{msg: "карточка не найдена", code: codes.NotFound}, "LISTING_NOT_FOUND")
+
+	st, ok := status.FromError(got)
+	require.True(t, ok)
+	assert.Equal(t, codes.NotFound, st.Code())
+	assert.Equal(t, "карточка не найдена", st.Message())
+}
+
 func TestToStatus_DobavlyaetErrorInfoDetail(t *testing.T) {
 	err := ToStatus(&domainErr{msg: "нет денег", code: codes.FailedPrecondition}, "INSUFFICIENT_FUNDS")
 

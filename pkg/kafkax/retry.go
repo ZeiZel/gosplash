@@ -2,8 +2,10 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -27,10 +29,8 @@ const MaxRetryRounds = 3
 
 // headerValue — общий разбор заголовка kgo.Record по имени.
 func headerValue(headers []kgo.RecordHeader, key string) (string, bool) {
-	for _, h := range headers {
-		if h.Key == key {
-			return string(h.Value), true
-		}
+	if i := slices.IndexFunc(headers, func(h kgo.RecordHeader) bool { return h.Key == key }); i >= 0 {
+		return string(headers[i].Value), true
 	}
 	return "", false
 }
@@ -270,7 +270,14 @@ func (rc *RetryConsumer) Run(ctx context.Context, handle Handler) error {
 		}
 		if errs := fetches.Errors(); len(errs) > 0 {
 			rc.client.AllowRebalance()
-			return fmt.Errorf("retry fetch: %w", errs[0].Err)
+			// errors.Join, а не errs[0]: ошибок может быть несколько (по
+			// одной на партицию), и все они части одного диагноза —
+			// см. тот же комментарий в Consumer.Run (kafka.go).
+			joined := make([]error, 0, len(errs))
+			for _, fe := range errs {
+				joined = append(joined, fe.Err)
+			}
+			return fmt.Errorf("retry fetch: %w", errors.Join(joined...))
 		}
 
 		engine.dispatch(fetches)
@@ -300,7 +307,7 @@ func (rc *RetryConsumer) processOne(ctx context.Context, record *kgo.Record, han
 	}
 
 	started := time.Now()
-	err := handle(ctx, &env)
+	err := handleSafely(ctx, record, handle, &env)
 	elapsed := time.Since(started)
 
 	if err == nil {
@@ -399,7 +406,7 @@ func (rc *RetryConsumer) commit(ctx context.Context, record *kgo.Record) {
 	cctx, cancel := detachedTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := rc.client.CommitRecords(cctx, record); err != nil {
-		slog.Error("kafka retry ✗ commit", "error", err)
+		slog.ErrorContext(ctx, "kafka retry ✗ commit", "error", err)
 	}
 }
 

@@ -2,8 +2,7 @@ package app
 
 import (
 	"context"
-	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"strconv"
 	"testing"
 
@@ -118,14 +117,16 @@ func TestInvariant_SummaProvodokVsegdaRavnaNulyu(t *testing.T) {
 	svc := NewService(store)
 	ctx := context.Background()
 
-	rng := rand.New(rand.NewSource(42))
+	// rand/v2: источник NewSource исчез, вместо него — явный PCG-генератор
+	// с фиксированным посевом; сценарий по-прежнему детерминирован.
+	rng := rand.New(rand.NewPCG(42, 42))
 	var activeReservations []string
 
-	for i := 0; i < 500; i++ {
-		switch rng.Intn(3) {
+	for i := range 500 {
+		switch rng.IntN(3) {
 		case 0: // ReserveFunds на случайную сумму со случайного счёта
-			acc := accounts[rng.Intn(len(accounts))].ID
-			amount := int64(1 + rng.Intn(5_000))
+			acc := accounts[rng.IntN(len(accounts))].ID
+			amount := int64(1 + rng.IntN(5_000))
 			key := "reserve-" + strconv.Itoa(i)
 			r, _, err := svc.Reserve(ctx, acc, domain.Money{AmountCents: amount, Currency: rub}, key)
 			if err == nil {
@@ -137,9 +138,9 @@ func TestInvariant_SummaProvodokVsegdaRavnaNulyu(t *testing.T) {
 			if len(activeReservations) == 0 {
 				continue
 			}
-			idx := rng.Intn(len(activeReservations))
+			idx := rng.IntN(len(activeReservations))
 			reservationID := activeReservations[idx]
-			payee := accounts[rng.Intn(len(accounts))].ID
+			payee := accounts[rng.IntN(len(accounts))].ID
 			_, err := svc.Commit(ctx, reservationID, payee, "commit-"+strconv.Itoa(i))
 			require.NoError(t, err)
 			activeReservations = append(activeReservations[:idx], activeReservations[idx+1:]...)
@@ -147,7 +148,7 @@ func TestInvariant_SummaProvodokVsegdaRavnaNulyu(t *testing.T) {
 			if len(activeReservations) == 0 {
 				continue
 			}
-			idx := rng.Intn(len(activeReservations))
+			idx := rng.IntN(len(activeReservations))
 			reservationID := activeReservations[idx]
 			_, err := svc.Release(ctx, reservationID, "случайная компенсация", "release-"+strconv.Itoa(i))
 			require.NoError(t, err)
@@ -318,7 +319,7 @@ func TestGetBalance_NeizvestnyySchyotVozvrashaetOshibku(t *testing.T) {
 
 	_, err := svc.GetBalance(context.Background(), 999)
 
-	require.True(t, errors.Is(err, domain.ErrAccountNotFound))
+	require.ErrorIs(t, err, domain.ErrAccountNotFound)
 }
 
 func TestReserve_NeizvestnyySchyotVozvrashaetOshibku(t *testing.T) {
@@ -327,7 +328,7 @@ func TestReserve_NeizvestnyySchyotVozvrashaetOshibku(t *testing.T) {
 
 	_, _, err := svc.Reserve(context.Background(), 999, domain.Money{AmountCents: 100, Currency: rub}, "order-12")
 
-	require.True(t, errors.Is(err, domain.ErrAccountNotFound))
+	require.ErrorIs(t, err, domain.ErrAccountNotFound)
 }
 
 func TestCommit_NeizvestnyRezervVozvrashaetOshibku(t *testing.T) {

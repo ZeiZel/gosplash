@@ -79,6 +79,52 @@ func TestAuth_ValidnyTokenProhoditIProkidyvaetUserID(t *testing.T) {
 	assert.Equal(t, "user-42", userID)
 }
 
+func TestAuth_TokenBezExpOtvergaetsya(t *testing.T) {
+	// jwt.WithExpirationRequired: токен без exp — это токен без срока
+	// жизни, и скомпрометированный такой токен пришлось бы отзывать
+	// бесконечно долго. Парсер обязан отвергать его так же, как и
+	// просроченный.
+	secret := []byte("секрет-теста")
+	impl := &fakeServer{}
+	cfg := ServerConfig{ServiceName: "test", JWTSecret: secret}
+	conn := newBufconnServer(t, impl, serverOpts(cfg)...)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "user-42",
+		// exp намеренно не проставлен.
+	})
+	signed, err := token.SignedString(secret)
+	require.NoError(t, err)
+
+	_, err = callEcho(withBearer(context.Background(), signed), conn, "привет")
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+func TestAuth_TokenSChuzhimAlgOtvergaetsya(t *testing.T) {
+	// WithValidMethods отбрасывает не-HMAC алгоритмы ещё до keyfunc:
+	// токен, заявляющий чужой алгоритм, не должен даже дойти до сверки
+	// секрета (защита в глубину к проверке внутри keyfunc). Классика
+	// атаки — alg=none: токен вообще без подписи.
+	secret := []byte("секрет-теста")
+	impl := &fakeServer{}
+	cfg := ServerConfig{ServiceName: "test", JWTSecret: secret}
+	conn := newBufconnServer(t, impl, serverOpts(cfg)...)
+
+	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
+		"sub": "user-42",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	signed, err := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
+	require.NoError(t, err)
+
+	_, err = callEcho(withBearer(context.Background(), signed), conn, "привет")
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
 func TestAuth_BezTokenaOtvergaetsya(t *testing.T) {
 	secret := []byte("секрет-теста")
 	impl := &fakeServer{}

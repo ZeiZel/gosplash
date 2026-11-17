@@ -24,7 +24,7 @@ func TestBreaker_ZakrytPerehoditVOtkrytPoslePorogaOtkazov(t *testing.T) {
 	require.Equal(t, gobreaker.StateClosed, b.State())
 
 	boom := errors.New("недоступен")
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		err := b.Execute(func() error { return boom })
 		require.ErrorIs(t, err, boom)
 	}

@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"uuid"
 
-	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/protobuf/proto"
@@ -55,12 +56,25 @@ func Write(ctx context.Context, tx *gorm.DB, service string, env *eventsv1.Envel
 	return nil
 }
 
-// Migrate создаёт таблицу outbox сервиса. Вызывается из migrations/auto.go
-// каждого сервиса вместо прямого AutoMigrate(&OutboxRow{}): имя таблицы
-// зависит от сервиса, и знать об этом должен пакет, а не каждый вызывающий.
+// Migrate создаёт таблицу outbox сервиса и служебный индекс под запросы relay.
+// Вызывается из migrations/auto.go каждого сервиса вместо прямого
+// AutoMigrate(&OutboxRow{}): имя таблицы зависит от сервиса, и знать об этом
+// должен пакет, а не каждый вызывающий.
 func Migrate(db *gorm.DB, service string) error {
 	if err := db.Table(TableFor(service)).AutoMigrate(&OutboxRow{}); err != nil {
 		return fmt.Errorf("outbox: миграция %s: %w", TableFor(service), err)
+	}
+	// Частичный индекс под ГОРЯЧИЙ запрос relay — `WHERE published_at IS NULL`
+	// (SELECT ... FOR UPDATE SKIP LOCKED и COUNT для outbox_pending): индекс
+	// держит только неопубликованные строки, поэтому остаётся крошечным при
+	// любом размере таблицы, в отличие от полного индекса по published_at.
+	// GORM тегами частичный индекс не выразить, поэтому сырой DDL рядом.
+	// Имя таблицы подставляется строкой, а не параметром — см. рассуждение
+	// о безопасности в TableFor; IF NOT EXISTS делает миграцию идемпотентной.
+	table := TableFor(service)
+	if err := db.Exec(`CREATE INDEX IF NOT EXISTS ` + table + `_pending_idx` +
+		` ON ` + table + ` (published_at) WHERE published_at IS NULL`).Error; err != nil {
+		return fmt.Errorf("outbox: миграция %s: индекс published_at: %w", table, err)
 	}
 	return nil
 }
@@ -93,9 +107,7 @@ func buildRow(ctx context.Context, service string, env *eventsv1.Envelope, topic
 	// которым pkg/kafkax/trace.go пользуется для заголовков kgo.Record.
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
-	for k, v := range carrier {
-		headers[k] = v
-	}
+	maps.Copy(headers, carrier)
 
 	headersJSON, err := json.Marshal(headers)
 	if err != nil {
@@ -119,9 +131,7 @@ func buildRow(ctx context.Context, service string, env *eventsv1.Envelope, topic
 // с новым id, event_id конверта при этом обязан остаться прежним, чтобы
 // consumer'ы дедуплицировали правильно), и совпадение id — деталь текущей
 // реализации, а не контракт, который есть смысл закреплять в коде.
-func newRowID() string {
-	if id, err := uuid.NewV7(); err == nil {
-		return id.String()
-	}
-	return uuid.NewString()
-}
+//
+// Стандартный uuid.NewV7 (Go 1.27) не возвращает ошибку — прежний запасной
+// вариант с v4 на случай отказа генератора стал не нужен и удалён.
+func newRowID() string { return uuid.NewV7().String() }

@@ -38,30 +38,45 @@ func (s *Store) WithinTx(ctx context.Context, fn func(ports.TxStore) error) erro
 
 // GetBalance читает баланс БЕЗ транзакции и без блокировок — см.
 // обоснование в internal/ports/ports.go у WalletStore.GetBalance.
+//
+// Все три числа (валюта, баланс, резервы) — ОДНИМ оператором со скалярными
+// подзапросами. Тремя отдельными запросами available = balance - reserved
+// мог смешать состояния разных моментов: если между чтением проводок и
+// чтением резервов закоммитился чужой CommitFunds, в balance он ещё не
+// виден, а в reserved его резерв уже не активен — available «прыгнул» бы
+// без всякой ошибки. Один оператор атомарен по определению в обеих
+// участвующих таблицах.
 func (s *Store) GetBalance(ctx context.Context, accountID int64) (domain.Balance, error) {
-	var account AccountRow
-	err := s.db.WithContext(ctx).Where("id = ?", accountID).First(&account).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	// row — ровно то, что возвращает оператор; без gorm-тегов и БЕЗ
+	// related-моделей: GetBalance не отображается в AccountRow, чтобы
+	// не тащить сюда колонки, которых в запросе нет.
+	var row struct {
+		Currency string
+		Balance  int64
+		Reserved int64
+	}
+	result := s.db.WithContext(ctx).Raw(`
+		SELECT a.currency,
+		       COALESCE((SELECT SUM(CASE WHEN l.direction = ? THEN l.amount_cents ELSE -l.amount_cents END)
+		                 FROM ledger_entries l WHERE l.account_id = a.id), 0) AS balance,
+		       COALESCE((SELECT SUM(r.amount_cents)
+		                 FROM reservations r WHERE r.account_id = a.id AND r.status = ?), 0) AS reserved
+		FROM accounts a
+		WHERE a.id = ?`,
+		domain.DirectionCredit, domain.ReservationActive, accountID,
+	).Scan(&row)
+	if result.Error != nil {
+		return domain.Balance{}, fmt.Errorf("wallet: чтение баланса: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
 		return domain.Balance{}, domain.ErrAccountNotFound
-	}
-	if err != nil {
-		return domain.Balance{}, fmt.Errorf("wallet: чтение счёта: %w", err)
-	}
-
-	balance, err := ledgerBalance(s.db.WithContext(ctx), accountID)
-	if err != nil {
-		return domain.Balance{}, err
-	}
-	reserved, err := activeReservedSum(s.db.WithContext(ctx), accountID)
-	if err != nil {
-		return domain.Balance{}, err
 	}
 
 	return domain.Balance{
 		AccountID: accountID,
-		Currency:  account.Currency,
-		Available: balance - reserved,
-		Reserved:  reserved,
+		Currency:  row.Currency,
+		Available: row.Balance - row.Reserved,
+		Reserved:  row.Reserved,
 	}, nil
 }
 

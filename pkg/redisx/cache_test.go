@@ -12,7 +12,7 @@ func TestWithJitter_PopadaetVDiapazonDesyatiProcentov(t *testing.T) {
 	lower := time.Duration(float64(ttl) * (1 - jitterFraction))
 	upper := time.Duration(float64(ttl) * (1 + jitterFraction))
 
-	for i := 0; i < 500; i++ {
+	for range 500 {
 		got := withJitter(ttl)
 		assert.GreaterOrEqualf(t, got, lower, "джиттер не должен опускать TTL ниже -10%%: %v", got)
 		assert.LessOrEqualf(t, got, upper, "джиттер не должен поднимать TTL выше +10%%: %v", got)
@@ -28,7 +28,7 @@ func TestWithJitter_ZначенияRazlichayutsyaMezhduVyzovami(t *testing.T) {
 	ttl := 10 * time.Minute
 
 	seen := make(map[time.Duration]struct{})
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		seen[withJitter(ttl)] = struct{}{}
 	}
 

@@ -110,7 +110,7 @@ func TestReindexer_PeregonyaetVsePoStranicam(t *testing.T) {
 	assert.False(t, result.DryRun)
 
 	require.Len(t, catalog.calls, 2, "обязана быть пройдена ровно вся пагинация: последняя страница с пустым next_cursor завершает цикл")
-	assert.Equal(t, "", catalog.calls[0].cursor)
+	assert.Empty(t, catalog.calls[0].cursor)
 	assert.Equal(t, "cursor-1", catalog.calls[1].cursor)
 	for _, c := range catalog.calls {
 		assert.Equal(t, int32(2), c.limit, "batch size обязан пробрасываться в каждый вызов ListListings")

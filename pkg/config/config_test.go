@@ -79,7 +79,9 @@ func TestRatio(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("GOSPLASH_TEST_RATIO", tt.value)
-			assert.Equal(t, tt.want, ratio("GOSPLASH_TEST_RATIO", 1.0))
+			// InDelta, а не Equal: ratio возвращает float64 из ParseFloat,
+			// и сравнение float на точное равенство — хрупкая проверка.
+			assert.InDelta(t, tt.want, ratio("GOSPLASH_TEST_RATIO", 1.0), 1e-9)
 		})
 	}
 }

@@ -111,12 +111,13 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 	// 32 МБ — сколько разрешено держать в памяти; остальное multipart-парсер
 	// сбросит во временный файл. Сам файл мы отсюда не читаем целиком:
 	// ниже он уезжает в хранилище как поток.
-	// nolint:gosec // G120 срабатывает ложно: предел на размер тела стоит
-	// строкой выше (http.MaxBytesReader), а анализатор не отслеживает поток
-	// данных через r.Body и видит только «ParseMultipartForm без обёртки».
-	// Глушим точечно, в одной строке, с объяснением — а не исключением
-	// правила во всём .golangci.yml, где оно перестало бы ловить настоящие
-	// случаи в других хендлерах.
+	//
+	// Замечание про gosec/G120 (ложное срабатывание): предел на размер тела
+	// стоит строкой выше (http.MaxBytesReader), а анализатор не отслеживает
+	// поток данных через r.Body и видит только «ParseMultipartForm без
+	// обёртки». Глушим точечно, в одной строке, с объяснением — а не
+	// исключением правила во всём .golangci.yml, где оно перестало бы ловить
+	// настоящие случаи в других хендлерах.
 	if err := r.ParseMultipartForm(32 << 20); err != nil { //nolint:gosec // см. комментарий выше
 		httpx.Error(w, "не удалось разобрать форму: "+err.Error(), http.StatusBadRequest)
 		return
@@ -149,8 +150,8 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		slog.Error("media: загрузка не удалась", "error", err)
-		httpx.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.ErrorContext(r.Context(), "media: загрузка не удалась", "error", err)
+		httpx.Error(w, "внутренняя ошибка сервера", http.StatusInternalServerError)
 		return
 	}
 
@@ -200,10 +201,7 @@ func (h *Handler) allowUpload(ctx context.Context, w http.ResponseWriter, userID
 	// предел ожидания ("подожди хотя бы столько"), округление вниз могло бы
 	// отправить повтор на долю секунды раньше, чем бакет реально накопит
 	// токен, и клиент получил бы ещё один 429 почти сразу же.
-	seconds := int(math.Ceil(retryAfter.Seconds()))
-	if seconds < 1 {
-		seconds = 1
-	}
+	seconds := max(int(math.Ceil(retryAfter.Seconds())), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	httpx.Error(w, "слишком много запросов, попробуйте позже", http.StatusTooManyRequests)
 	return false
@@ -227,7 +225,8 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.ErrorContext(r.Context(), "media: получение фото не удалось", "error", err, "photo_id", r.PathValue("id"))
+		httpx.Error(w, "внутренняя ошибка сервера", http.StatusInternalServerError)
 		return
 	}
 
@@ -256,8 +255,8 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		slog.Error("media: удаление не удалось", "error", err)
-		httpx.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.ErrorContext(r.Context(), "media: удаление не удалось", "error", err, "photo_id", r.PathValue("id"))
+		httpx.Error(w, "внутренняя ошибка сервера", http.StatusInternalServerError)
 		return
 	}
 
@@ -281,7 +280,8 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 
 	photos, err := h.service.ListByUser(r.Context(), userID, limit)
 	if err != nil {
-		httpx.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.ErrorContext(r.Context(), "media: список фото не получен", "error", err, "user_id", userID)
+		httpx.Error(w, "внутренняя ошибка сервера", http.StatusInternalServerError)
 		return
 	}
 
@@ -303,7 +303,8 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) shards(w http.ResponseWriter, r *http.Request) {
 	counts, err := h.service.CountByShard(r.Context())
 	if err != nil {
-		httpx.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.ErrorContext(r.Context(), "media: подсчёт по шардам не удался", "error", err)
+		httpx.Error(w, "внутренняя ошибка сервера", http.StatusInternalServerError)
 		return
 	}
 	httpx.JSON(w, map[string]any{"photos_per_shard": counts}, http.StatusOK)
@@ -340,7 +341,14 @@ func (h *Handler) view(r *http.Request, p *domain.Photo) photoView {
 		CreatedAt: p.CreatedAt,
 	}
 	// Ссылка временная и подписанная: бакет с оригиналами приватный.
-	if url, err := h.service.DownloadURL(r.Context(), p, h.presignedTTL); err == nil {
+	if url, err := h.service.DownloadURL(r.Context(), p, h.presignedTTL); err != nil {
+		// DownloadURL — обогащение ответа, а не обязательное поле: карточка
+		// валидна и без ссылки. Но молча глотать ошибку нельзя — без лога
+		// «у половины карточек нет ссылок» пришлось бы ловить жалобой
+		// пользователя. Warn, а не Error: сам запрос при этом успешен.
+		slog.WarnContext(r.Context(), "media: не удалось подписать ссылку на оригинал",
+			"error", err, "photo_id", p.ID)
+	} else {
 		v.DownloadURL = url
 	}
 	return v

@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +24,7 @@ func TestRecover_PanikaStanovitsya500(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	require.NotPanics(t, func() {
-		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
 	})
 
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
@@ -56,7 +57,7 @@ func TestChain_PoryadokVypolneniya(t *testing.T) {
 		}),
 		mark("внешний"), mark("внутренний"),
 	)
-	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
 
 	assert.Equal(t, []string{
 		"внешний:до", "внутренний:до", "хендлер", "внутренний:после", "внешний:после",

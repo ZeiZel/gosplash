@@ -67,7 +67,7 @@ func run() error {
 		// NotFound и InvalidArgument повторять бессмысленно,
 		// Unavailable и DeadlineExceeded — наоборот, стоит.
 		st, _ := status.FromError(err)
-		return fmt.Errorf("GetPhoto: %s: %s", st.Code(), st.Message())
+		return fmt.Errorf("get photo: %s: %s", st.Code(), st.Message())
 	}
 
 	// protojson печатает protobuf в JSON по правилам самого протокола

@@ -153,7 +153,7 @@ type listingView struct {
 	PriceCents  int64             `json:"price_cents"`
 	Currency    string            `json:"currency"`
 	Status      string            `json:"status"`
-	PublishedAt time.Time         `json:"published_at,omitempty"`
+	PublishedAt time.Time         `json:"published_at,omitzero"`
 	Width       int32             `json:"width"`
 	Height      int32             `json:"height"`
 }

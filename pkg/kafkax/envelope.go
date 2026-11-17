@@ -3,8 +3,8 @@ package kafkax
 import (
 	"fmt"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -73,11 +73,6 @@ func OccurredAt(env *eventsv1.Envelope) time.Time {
 // разбрасывал бы их по всему B-tree, грея случайные страницы и раздувая WAL.
 // С v7 вставка всегда идёт в «правый край» индекса.
 //
-// Если генератор откажет (это возможно только при отказе источника
-// случайности), падаем на v4: лучше непоследовательный id, чем пустой.
-func newEventID() string {
-	if id, err := uuid.NewV7(); err == nil {
-		return id.String()
-	}
-	return uuid.NewString()
-}
+// Стандартный uuid.NewV7 (Go 1.27) не возвращает ошибку — прежний запасной
+// вариант с v4 на случай отказа генератора стал не нужен и удалён.
+func newEventID() string { return uuid.NewV7().String() }

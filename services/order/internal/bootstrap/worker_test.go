@@ -57,6 +57,7 @@ func newLazyTemporalClient(t *testing.T) sdkclient.Client {
 }
 
 func validWorkerDeps(t *testing.T) bootstrap.WorkerDeps {
+	t.Helper()
 	return bootstrap.WorkerDeps{
 		WalletSaga:     fakeWalletSaga{},
 		CatalogSaga:    fakeCatalogSaga{},

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"slices"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -22,8 +23,10 @@ type Middleware func(http.Handler) http.Handler
 // остальных, иначе паника в middleware уронит процесс до того, как её
 // кто-нибудь поймает.
 func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
-	for i := len(middlewares) - 1; i >= 0; i-- {
-		h = middlewares[i](h)
+	// slices.Backward: собираем от последнего к первому, чтобы ПЕРВЫЙ
+	// аргумент оказался внешней обёрткой (см. семантику выше).
+	for _, mw := range slices.Backward(middlewares) {
+		h = mw(h)
 	}
 	return h
 }

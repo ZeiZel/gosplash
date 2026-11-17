@@ -73,7 +73,7 @@ func (r row) cursorKey() (time.Time, string, bool) { return r.at, r.id, true }
 func fixtureRows(n int) []row {
 	base := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
 	rows := make([]row, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// Убывающее время — тот же порядок, что и ORDER BY published_at DESC
 		// в реальном запросе.
 		rows[i] = row{at: base.Add(-time.Duration(i) * time.Minute), id: fmt.Sprintf("photo-%d", i)}

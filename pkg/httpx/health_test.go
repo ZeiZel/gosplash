@@ -29,7 +29,7 @@ func do(t *testing.T, router *http.ServeMux, path string) (int, map[string]any) 
 	t.Helper()
 
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	router.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, nil))
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
@@ -63,7 +63,8 @@ func TestReadyz_ZdorovyySlucay(t *testing.T) {
 	assert.Equal(t, http.StatusOK, code)
 	assert.Equal(t, true, body["ready"])
 
-	checks := body["checks"].(map[string]any)
+	checks, ok := body["checks"].(map[string]any)
+	require.True(t, ok, "readyz обязан вернуть объект checks")
 	assert.Equal(t, "ok", checks["postgres"])
 	assert.Equal(t, "ok", checks["kafka"])
 }
@@ -83,7 +84,8 @@ func TestReadyz_UpavshayaZavisimost(t *testing.T) {
 	assert.Equal(t, http.StatusServiceUnavailable, code)
 	assert.Equal(t, false, body["ready"])
 
-	checks := body["checks"].(map[string]any)
+	checks, ok := body["checks"].(map[string]any)
+	require.True(t, ok, "readyz обязан вернуть объект checks")
 	assert.Equal(t, "ok", checks["postgres"], "здоровые проверки всё равно показываются")
 	assert.Contains(t, checks["kafka"], "no brokers available",
 		"причина должна быть видна прямо в ответе, а не только в логах")
@@ -104,7 +106,9 @@ func TestReadyz_PosleNotReady(t *testing.T) {
 	code, body := do(t, router, "/readyz")
 	assert.Equal(t, http.StatusServiceUnavailable, code)
 	assert.Equal(t, false, body["ready"])
-	assert.Contains(t, body["checks"].(map[string]any), "shutdown")
+	checks, ok := body["checks"].(map[string]any)
+	require.True(t, ok, "readyz обязан вернуть объект checks")
+	assert.Contains(t, checks, "shutdown")
 
 	// Liveness при этом обязан оставаться зелёным: под ещё доделывает работу,
 	// и перезапускать его сейчас — значит оборвать её на середине.

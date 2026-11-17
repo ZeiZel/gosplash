@@ -50,8 +50,26 @@ env:
   # `make tools` (для локальной разработки, где такой сюрприз замечают сразу
   # и чинят на месте) отличается от CI, где сюрприз находит кто-то другой
   # неделю спустя.
-  GOLANGCI_LINT_VERSION: v2.13.2
+  #
+  # v2.15.0, а не v2.13.2: внутри v2.13.2 зашпилен x/tools v0.49, который не
+  # умеет читать export data версии 5 — её пишет компилятор go1.27.3+, и
+  # локальный запуск линтера на этой машине падал на typechecking раньше,
+  # чем находил хоть одну проблему. v2.15.0 несёт x/tools v0.52 и читает
+  # обе версии; заодно это совпадает с тем, что ставит `make tools`
+  # (latest на момент правки), — локальный и CI-прогоны не расходятся.
+  GOLANGCI_LINT_VERSION: v2.15.0
   BUF_VERSION: "1.50.0"
+  # Версии protoc-плагинов для проверки gen-drift ниже — те же правила, что
+  # и для golangci-lint: @latest означал бы, что генерация "поплыла" бы без
+  # единой правки в репозитории в день релиза плагина. Значения — РОВНО те,
+  # которыми сгенерирован закоммиченный gen/ (drift-джоба ниже сверяет именно
+  # с ними): protoc-gen-go v1.36.11 и protoc-gen-go-grpc v1.6.2. Обновлять
+  # пин = перегенерировать gen/ тем же коммитом, иначе проверка станет
+  # красной. Те же версии запинены в цели `make tools`.
+  PROTOC_GEN_GO_VERSION: v1.36.11
+  PROTOC_GEN_GO_GRPC_VERSION: v1.6.2
+  # govulncheck: см. job govulncheck ниже (advisory, не блокирующий).
+  GOVULNCHECK_VERSION: v1.9.0
 
 jobs:
   # ───────────────────────────────────────────────────────────────────────
@@ -60,6 +78,7 @@ jobs:
   modules:
     name: список модулей (go.work)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       modules: ${{ steps.list.outputs.modules }}
     steps:
@@ -78,6 +97,9 @@ jobs:
   lint-proto:
     name: lint / buf
     runs-on: ubuntu-latest
+    # buf + генерация + git diff — минуты, не больше; зависший раннер
+    # дешевле прибить таймаутом, чем ждать шесть часов до лимита GitHub.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -122,15 +144,19 @@ jobs:
       # удалением gen/ из гита, а проверкой здесь — перегенерировать и
       # упасть, если появился diff. Тогда расхождение видно в пулл-реквесте,
       # а не через неделю в рантайме.
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.work
           cache: false
 
       - name: Плагины protoc
+        # Версии — из env-переменных наверху файла (те же, что ставит
+        # gen-drift), а не @latest: проверка "gen/go не разъехался" имеет
+        # смысл только против ЗАФИКСИРОВАННОЙ версии генератора — иначе
+        # любой релиз плагина превращается в ложный "drift" для всех PR.
         run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ env.PROTOC_GEN_GO_VERSION }}
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ env.PROTOC_GEN_GO_GRPC_VERSION }}
 
       - name: gen/go не разъехался с proto/
         run: |
@@ -153,6 +179,9 @@ jobs:
     name: lint / golangci-lint (${{ matrix.module }})
     needs: modules
     runs-on: ubuntu-latest
+    # Один модуль линтится заметно меньше 10 минут даже с холодным кэшем
+    # (run.timeout в .golangci.yml — 5m); двойной запас на очереди раннеров.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -186,6 +215,7 @@ jobs:
   lint-misc:
     name: lint / gofmt + archcheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -206,12 +236,90 @@ jobs:
         run: go run ./tools/archcheck/cmd/archcheck -root . -v
 
   # ───────────────────────────────────────────────────────────────────────
+  # modules-tidy — детект дрифта go.mod/go.sum: `go mod tidy` обязан быть
+  # no-op'ом для каждого модуля, а `go work sync` — не менять go.work.sum.
+  # Ловит забытые после правок require-строки и расхождения, которые
+  # всплывают у коллеги в чужой сборке через неделю (профилактика по
+  # навыку golang-ci: дрифт зависимостей ловится в PR, где его видно).
+  # ───────────────────────────────────────────────────────────────────────
+  modules-tidy:
+    name: tidy drift (go.mod / go.sum / go.work.sum)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      - name: go work sync + go mod tidy по всем модулям
+        # Список модулей — из find по go.mod (а не из go.work): источник
+        # правды "какие модули вообще существуют" — файловая система,
+        # go.work может отставать, и это тоже дрифт, который видно здесь.
+        # .zcode — локальные ассеты скиллов с примерами go.mod, в workspace
+        # не входят (и в CI не попадают); исключаем, чтобы команда была
+        # дословно воспроизводима и на машине разработчика.
+        run: |
+          go work sync
+          find . -name go.mod -not -path './.git/*' -not -path './.zcode/*' -printf '%h\n' | sort -u |
+          while read -r dir; do
+            echo "→ $dir"
+            (cd "$dir" && go mod tidy) || exit 1
+          done
+
+      - name: git diff --exit-code
+        run: |
+          if git diff --exit-code; then
+            echo "модули опрятны: tidy ничего не изменил"
+          else
+            echo "::error::go.mod/go.sum/go.work.sum изменились после go work sync + go mod tidy — выполни 'make tidy' и закоммить результат"
+            git diff --stat
+            exit 1
+          fi
+
+  # ───────────────────────────────────────────────────────────────────────
+  # govulncheck — сканирование известных уязвимостей (stdlib + зависимости)
+  # по каждому модулю. ADVISORY (continue-on-error), а не блокирующий:
+  # база CVE обновляется ежедневно, и новая уязвимость в ЗАФИКСИРОВАННОЙ
+  # версии зависимости не должна останавливать учебный PR — находка видна
+  # жёлтым маркером в сводке checks, а решение об обновлении зависимости
+  # принимается отдельно (в продуктовом репозитории это был бы блокирующий
+  # job с SLA на обновление).
+  # ───────────────────────────────────────────────────────────────────────
+  govulncheck:
+    name: govulncheck (${{ matrix.module }})
+    needs: modules
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.modules.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache-dependency-path: "**/go.sum"
+
+      - name: govulncheck ./...
+        working-directory: ${{ matrix.module }}
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
+
+  # ───────────────────────────────────────────────────────────────────────
   # test — go test -race по каждому модулю отдельно + покрытие артефактом.
   # ───────────────────────────────────────────────────────────────────────
   test:
     name: test (${{ matrix.module }})
     needs: modules
     runs-on: ubuntu-latest
+    # Unit-тесты самого тяжёлого модуля (media) идут ~минуты с -race;
+    # 15 минут хватает с запасом, а зависший test ловится раньше лимита.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -230,7 +338,12 @@ jobs:
         # (минуты, а не секунды, и нужен Docker), смешивать с обычным `test`
         # означало бы, что каждый PR ждёт поднятия Kafka/Postgres/ClickHouse
         # ради unit-проверки одной функции.
-        run: go test ./... -race -count=1 -covermode=atomic -coverprofile=coverage.out
+        #
+        # -shuffle=on перемешивает порядок тестов: ловит тесты, которые
+        # незаметно зависят от порядка выполнения и от глобального состояния,
+        # оставленного предыдущими тестами (кэши, env, горутины) — такие
+        # тесты зелёные локально и флакают в CI, где порядок другой.
+        run: go test ./... -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out
 
       - name: имя артефакта из пути модуля
         id: meta
@@ -283,6 +396,10 @@ jobs:
     name: integration (${{ matrix.module }})
     runs-on: ubuntu-latest
     continue-on-error: true
+    # Скачивание образов Kafka/ClickHouse/Elasticsearch — самая долгая часть
+    # прогона; 30 минут покрывают самый медленный матричный элемент, но
+    # защищают от зависших testcontainers навсегда.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -302,9 +419,14 @@ jobs:
       # запущен — testcontainers-go подключается к нему через сокет без
       # какой-либо дополнительной настройки (ровно то допущение, о котором
       # говорит задание фазы 6: "в GitHub Actions docker доступен").
+      #
+      # -race здесь по той же причине, что и в unit-джобе test: контейнерные
+      # тесты гоняют настоящие горутины адаптеров (batcher ClickHouse,
+      # bulk-индексер ES, relay outbox), и гонки в них видны только под
+      # детектором; на Linux-раннере CGO для -race есть из коробки.
       - name: go test -tags=integration
         working-directory: ${{ matrix.module }}
-        run: go test ./... -tags=integration -count=1 -timeout=15m
+        run: go test ./... -tags=integration -race -count=1 -timeout=15m
 
   # ───────────────────────────────────────────────────────────────────────
   # build — все бинарники сервисов и утилит, а дальше — сами Docker-образы.
@@ -324,6 +446,9 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    # make build + build-linux + docker build всех образов; холодный кэш
+    # Go замедляет первый билд, но не на 15 минут.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

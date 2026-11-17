@@ -33,25 +33,24 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-
 	catalogv1 "gosplash/gen/go/gosplash/catalog/v1"
 	mediav1 "gosplash/gen/go/gosplash/media/v1"
 	"gosplash/pkg/config"
 	"gosplash/pkg/dbx"
+	"gosplash/pkg/grpcx"
 	"gosplash/pkg/httpx"
 	"gosplash/pkg/kafkax"
 	"gosplash/pkg/otelx"
 	"gosplash/pkg/outbox"
 	"gosplash/pkg/redisx"
+	"gosplash/pkg/resilience"
 
 	cataloggrpc "gosplash/services/catalog/internal/adapters/grpc"
 	catalogkafka "gosplash/services/catalog/internal/adapters/kafka"
@@ -106,22 +105,26 @@ func run() error {
 	}
 	defer redisClient.Close()
 
-	// ── gRPC-клиент к media ──────────────────────────────────────────────────
-	// grpc.NewClient не устанавливает соединение немедленно: он создаёт
-	// «ленивый» канал, который подключится при первом вызове и сам будет
-	// переподключаться. Поэтому порядок запуска сервисов не важен —
-	// catalog спокойно стартует раньше media.
-	mediaConn, err := grpc.NewClient(
-		conf.Catalog.MediaGRPCTarget,
-		// Без TLS: внутренняя сеть локальной разработки (pkg/grpcx, раздел
-		// «чего сознательно нет»).
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	// ── gRPC-клиент к media: ТОЛЬКО чтение (GetPhoto) ───────────────────────
+	// grpcx.Dial, а не голый grpc.NewClient: keepalive-пинги, round_robin,
+	// retry и circuit breaker — единый путь всех клиентов монорепы (так же,
+	// как services/order/cmd/order/main.go ходит в catalog).
+	// resilience.Idempotent — безопасно ретраить на транспорте: catalog зовёт
+	// у media только GetPhoto, это чтение. Соединение остаётся ленивым (внутри
+	// grpcx.Dial тот же grpc.NewClient): подключится при первом вызове, поэтому
+	// порядок запуска сервисов не важен — catalog спокойно стартует раньше media.
+	mediaConn, err := grpcx.Dial(conf.Catalog.MediaGRPCTarget,
+		grpcx.WithRetry(resilience.DefaultRetryConfig(), resilience.Idempotent),
+		grpcx.WithBreaker(resilience.DefaultBreakerConfig("media")),
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("catalog: gRPC к media: %w", err)
 	}
-	defer func() { _ = mediaConn.Close() }()
+	defer func() {
+		if err := mediaConn.Close(); err != nil {
+			slog.Error("catalog: закрытие соединения с media", "error", err)
+		}
+	}()
 
 	// ── Kafka: продюсер (просмотры) и консьюмеры ──────────────────────────────
 	producer, err := kafkax.NewProducer(conf.Kafka.Brokers, serviceName)
@@ -169,11 +172,13 @@ func run() error {
 
 	// ── Outbox-relay: catalog.listing.published → Kafka ───────────────────────
 	relay, err := outbox.New(outbox.Config{
-		ServiceName:  serviceName,
-		Brokers:      conf.Kafka.Brokers,
-		DSNs:         []string{conf.Catalog.PrimaryDSN},
-		PollInterval: conf.Outbox.PollInterval,
-		BatchSize:    conf.Outbox.BatchSize,
+		ServiceName:     serviceName,
+		Brokers:         conf.Kafka.Brokers,
+		DSNs:            []string{conf.Catalog.PrimaryDSN},
+		PollInterval:    conf.Outbox.PollInterval,
+		BatchSize:       conf.Outbox.BatchSize,
+		Retention:       conf.Outbox.Retention,
+		CleanupInterval: conf.Outbox.CleanupInterval,
 	})
 	if err != nil {
 		return err

@@ -218,7 +218,7 @@ func StreamServerInterceptors(cfg ServerConfig) []grpc.StreamServerInterceptor {
 }
 
 // wrappedStream подменяет Context(), возвращаемый серверным стримом:
-// grpc.ServerStream не даёt другого способа изменить context на пути вниз
+// grpc.ServerStream не даёт другого способа изменить context на пути вниз
 // по цепочке интерсепторов.
 type wrappedStream struct {
 	grpc.ServerStream
@@ -343,7 +343,18 @@ func authenticate(ctx context.Context, secret []byte) (string, error) {
 			return nil, fmt.Errorf("неожиданный метод подписи: %v", t.Header["alg"])
 		}
 		return secret, nil
-	})
+	},
+		// Опции парсера — вторая линия обороны (защита в глубину), а не
+		// замена keyfunc: WithValidMethods отбрасывает чужие alg ещё ДО
+		// вызова keyfunc, WithExpirationRequired запрещает вечные токены
+		// (без exp скомпрометированный токен жил бы бесконечно), а leeway
+		// в 30 секунд прощает рассинхрон часов между сервисами одного
+		// кластера, не открывая окно для протухших токенов сколь-нибудь
+		// заметной ширины.
+		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg(), jwt.SigningMethodHS384.Alg(), jwt.SigningMethodHS512.Alg()}),
+		jwt.WithLeeway(30*time.Second),
+	)
 	if err != nil || !token.Valid {
 		return "", status.Error(codes.Unauthenticated, "невалидный токен")
 	}

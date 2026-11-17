@@ -13,19 +13,19 @@ func TestRetryable_ErrorsIs(t *testing.T) {
 	cause := errors.New("s3 недоступен")
 	err := Retryable(cause)
 
-	assert.True(t, errors.Is(err, ErrRetryable))
-	assert.False(t, errors.Is(err, ErrPermanent))
+	assert.ErrorIs(t, err, ErrRetryable)
+	assert.NotErrorIs(t, err, ErrPermanent)
 	// Исходная ошибка должна остаться доступной дальше по цепочке.
-	assert.True(t, errors.Is(err, cause))
+	assert.ErrorIs(t, err, cause)
 }
 
 func TestPermanent_ErrorsIs(t *testing.T) {
 	cause := errors.New("неизвестный event_type")
 	err := Permanent(cause)
 
-	assert.True(t, errors.Is(err, ErrPermanent))
-	assert.False(t, errors.Is(err, ErrRetryable))
-	assert.True(t, errors.Is(err, cause))
+	assert.ErrorIs(t, err, ErrPermanent)
+	assert.NotErrorIs(t, err, ErrRetryable)
+	assert.ErrorIs(t, err, cause)
 }
 
 func TestRetryable_Permanent_Nil(t *testing.T) {
@@ -38,7 +38,7 @@ func TestClassifiedError_ErrorTekstSohranyaetsya(t *testing.T) {
 	// прокидывать исходное сообщение, иначе лог получит бесполезное "".
 	err := fmt.Errorf("upsert карточки: %w", Retryable(errors.New("connection refused")))
 	assert.Contains(t, err.Error(), "connection refused")
-	assert.True(t, errors.Is(err, ErrRetryable))
+	assert.ErrorIs(t, err, ErrRetryable)
 }
 
 func TestIsPermanent(t *testing.T) {

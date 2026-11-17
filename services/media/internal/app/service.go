@@ -17,8 +17,7 @@ import (
 	"path"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 
 	"gosplash/services/media/internal/domain"
 	"gosplash/services/media/internal/ports"
@@ -28,6 +27,20 @@ type PhotoService struct {
 	repo    ports.PhotoRepository
 	storage ports.ObjectStorage
 	bucket  string
+}
+
+// keyExtAllowlist — разрешённые суффиксы S3-ключа, полученные из расширения
+// имени файла. Расширение — данные клиента, и без фильтра оно попадало в ключ
+// как есть: path.Ext("a.jpg%00.exe") или экзотика вида ".png " образовывали
+// мусорные (а при желании — и специально сконструированные) суффиксы. Всё,
+// чего нет в списке, даёт пустой суффикс: ключ остаётся валидным, реальный
+// формат всё равно определяется по байтам (sniffImage), а не по расширению.
+var keyExtAllowlist = map[string]string{
+	".jpg":  ".jpg",
+	".jpeg": ".jpeg",
+	".png":  ".png",
+	".gif":  ".gif",
+	".webp": ".webp",
 }
 
 func NewPhotoService(
@@ -99,12 +112,16 @@ func (s *PhotoService) Upload(ctx context.Context, in UploadInput) (*domain.Phot
 		return nil, err
 	}
 
-	id := uuid.NewString()
+	// NewV7 (время-упорядоченный), а не случайный V4: свежие фото и в
+	// индексе БД ложатся рядом (локальность страниц при вставках), и в
+	// листингах S3 идут по времени — уникальность и формат строки те же.
+	id := uuid.NewV7().String()
 
 	// Ключ детерминирован и начинается с user_id. Это не украшение:
 	// по префиксу видно, чьи файлы, их удобно чистить целиком, а в реальном S3
 	// префикс ещё и влияет на то, как хранилище распределяет нагрузку.
-	key := fmt.Sprintf("originals/%d/%s%s", in.UserID, id, strings.ToLower(path.Ext(in.Filename)))
+	// Суффикс — только из allowlist выше: расширение присылает клиент.
+	key := fmt.Sprintf("originals/%d/%s%s", in.UserID, id, keyExtAllowlist[strings.ToLower(path.Ext(in.Filename))])
 
 	// 2. Байты. content — поток (io.MultiReader из sniffImage), а не []byte:
 	// файл на 50 МБ проходит через сервис кусками и не оседает в памяти целиком.

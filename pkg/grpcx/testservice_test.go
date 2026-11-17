@@ -52,11 +52,11 @@ func testServiceEchoHandler(srv any, ctx context.Context, dec func(any) error, i
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(testServiceServer).Echo(ctx, in)
+		return srv.(testServiceServer).Echo(ctx, in) //nolint:forcetypeassert // копия формы protoc-gen-go-grpc (см. шапку файла)
 	}
 	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: testMethodEcho}
 	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(testServiceServer).Echo(ctx, req.(*wrapperspb.StringValue))
+		return srv.(testServiceServer).Echo(ctx, req.(*wrapperspb.StringValue)) //nolint:forcetypeassert // копия формы protoc-gen-go-grpc (см. шапку файла)
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -67,11 +67,11 @@ func testServicePanicHandler(srv any, ctx context.Context, dec func(any) error, 
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(testServiceServer).Panic(ctx, in)
+		return srv.(testServiceServer).Panic(ctx, in) //nolint:forcetypeassert // копия формы protoc-gen-go-grpc (см. шапку файла)
 	}
 	info := &grpc.UnaryServerInfo{Server: srv, FullMethod: testMethodPanic}
 	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(testServiceServer).Panic(ctx, req.(*wrapperspb.StringValue))
+		return srv.(testServiceServer).Panic(ctx, req.(*wrapperspb.StringValue)) //nolint:forcetypeassert // копия формы protoc-gen-go-grpc (см. шапку файла)
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -81,7 +81,7 @@ func testServiceEchoStreamHandler(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(testServiceServer).EchoStream(m, &testServiceEchoStreamServer{stream})
+	return srv.(testServiceServer).EchoStream(m, &testServiceEchoStreamServer{stream}) //nolint:forcetypeassert // копия формы protoc-gen-go-grpc (см. шапку файла)
 }
 
 func testServicePanicStreamHandler(srv any, stream grpc.ServerStream) error {
@@ -89,7 +89,7 @@ func testServicePanicStreamHandler(srv any, stream grpc.ServerStream) error {
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(testServiceServer).PanicStream(m, &testServiceEchoStreamServer{stream})
+	return srv.(testServiceServer).PanicStream(m, &testServiceEchoStreamServer{stream}) //nolint:forcetypeassert // копия формы protoc-gen-go-grpc (см. шапку файла)
 }
 
 var testServiceDesc = grpc.ServiceDesc{

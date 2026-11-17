@@ -176,8 +176,9 @@ func (r *Retrier) Do(ctx context.Context, method string, op func(ctx context.Con
 // на настоящий Do() с фейковой сетью.
 func fullJitterDelay(cfg RetryConfig, attempt int) time.Duration {
 	backoff := float64(cfg.BaseDelay) * math.Pow(2, float64(attempt))
-	if maxDelay := float64(cfg.MaxDelay); cfg.MaxDelay > 0 && backoff > maxDelay {
-		backoff = maxDelay
+	// MaxDelay == 0 — «без потолка», поэтому clamp только когда предел задан.
+	if cfg.MaxDelay > 0 {
+		backoff = min(backoff, float64(cfg.MaxDelay))
 	}
 	if backoff <= 0 {
 		return 0

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -135,9 +135,10 @@ func (r *LicenseRepository) Revoke(ctx context.Context, orderID, reason string) 
 	return result.RowsAffected > 0, nil
 }
 
+// newLicenseID — v7 (сортируемый по времени идентификатор). Стандартный
+// uuid вместо github.com/google/uuid: NewV7 в stdlib не возвращает ошибку
+// (недостаток энтропии там паникует, а не делегирует вызывающему), поэтому
+// ветка-фолбэк на v4 больше не нужна.
 func newLicenseID() string {
-	if id, err := uuid.NewV7(); err == nil {
-		return id.String()
-	}
-	return uuid.NewString()
+	return uuid.NewV7().String()
 }

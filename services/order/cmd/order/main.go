@@ -179,11 +179,13 @@ func run() error {
 	// relay здесь вычитывает обе записи независимо от того, какой процесс
 	// их создал (см. pkg/outbox: relay — просто доставщик чужих строк).
 	relay, err := outbox.New(outbox.Config{
-		ServiceName:  serviceName,
-		Brokers:      conf.Kafka.Brokers,
-		DSNs:         []string{orderConf.DSN},
-		PollInterval: conf.Outbox.PollInterval,
-		BatchSize:    conf.Outbox.BatchSize,
+		ServiceName:     serviceName,
+		Brokers:         conf.Kafka.Brokers,
+		DSNs:            []string{orderConf.DSN},
+		PollInterval:    conf.Outbox.PollInterval,
+		BatchSize:       conf.Outbox.BatchSize,
+		Retention:       conf.Outbox.Retention,
+		CleanupInterval: conf.Outbox.CleanupInterval,
 	})
 	if err != nil {
 		return fmt.Errorf("order: outbox relay: %w", err)

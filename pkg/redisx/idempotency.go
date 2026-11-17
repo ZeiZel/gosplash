@@ -65,6 +65,13 @@ const (
 	envelopeDone       = "done"
 )
 
+// beginRaceAttempts — предел итераций Begin на гонку «ключ протух между
+// SETNX и GET». Цикл вместо рекурсии: рекурсия на упорной гонке росла бы
+// безгранично (каждый повтор — новый кадр стека и новый SETNX), а после
+// нескольких неудач подряд честнее вернуть ошибку, чем молотить Redis —
+// три попытки покрывают окно в единицы миллисекунд с запасом.
+const beginRaceAttempts = 3
+
 // Begin фиксирует попытку выполнить операцию с ключом key.
 //
 // Если ttl <= 0, используется DefaultIdempotencyTTL (24 часа — время,
@@ -81,42 +88,50 @@ func (c *Client) Begin(ctx context.Context, key string, ttl time.Duration) (Idem
 		return IdempotencyResult{}, fmt.Errorf("redisx: marshal envelope: %w", err)
 	}
 
-	// SET NX — атомарная проверка «ключа ещё не было» и его занятие ЗА ОДНО
-	// обращение к Redis. Если бы вместо этого сначала делали GET, а по его
-	// отсутствию — SET, между этими двумя командами мог бы вклиниться другой
-	// параллельный повтор с тем же Idempotency-Key и тоже увидеть «ключа нет» —
-	// именно та гонка, от которой идемпотентность должна защищать в первую
-	// очередь.
-	ok, err := c.rdb.SetNX(ctx, key, data, ttl).Result()
-	if err != nil {
-		return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: %w", key, err)
-	}
-	if ok {
-		return IdempotencyResult{Status: IdempotencyFree}, nil
-	}
+	for range beginRaceAttempts {
+		// SET NX — атомарная проверка «ключа ещё не было» и его занятие ЗА
+		// ОДНО обращение к Redis. Если бы вместо этого сначала делали GET, а
+		// по его отсутствию — SET, между этими двумя командами мог бы
+		// вклиниться другой параллельный повтор с тем же Idempotency-Key и
+		// тоже увидеть «ключа нет» — именно та гонка, от которой
+		// идемпотентность должна защищать в первую очередь.
+		ok, err := c.rdb.SetNX(ctx, key, data, ttl).Result()
+		if err != nil {
+			return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: %w", key, err)
+		}
+		if ok {
+			return IdempotencyResult{Status: IdempotencyFree}, nil
+		}
 
-	raw, err := c.rdb.Get(ctx, key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		// Ключ протух между нашим SETNX и этим GET (окно в пару миллисекунд,
-		// но при TTL в 24 часа это означает, что кто-то держал ключ до самого
-		// конца — маловероятно, но не невозможно). Трактуем как обычный
-		// первый запрос: SETNX уже гарантировал бы провал, если бы кто-то
-		// снова успел занять ключ первым.
-		return c.Begin(ctx, key, ttl)
-	}
-	if err != nil {
-		return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: get: %w", key, err)
-	}
+		raw, err := c.rdb.Get(ctx, key).Bytes()
+		if errors.Is(err, redis.Nil) {
+			// Ключ протух между нашим SETNX и этим GET (окно в пару
+			// миллисекунд, но при TTL в 24 часа это означает, что кто-то
+			// держал ключ до самого конца — маловероятно, но не невозможно).
+			// Трактуем как обычный первый запрос и пробуем занять ключ ещё
+			// раз: SETNX на следующей итерации гарантированно провалится,
+			// если кто-то успел занять ключ первым.
+			continue
+		}
+		if err != nil {
+			return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: get: %w", key, err)
+		}
 
-	var env idempotencyEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: unmarshal: %w", key, err)
-	}
+		var env idempotencyEnvelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: unmarshal: %w", key, err)
+		}
 
-	if env.Status == envelopeDone {
-		return IdempotencyResult{Status: IdempotencyDone, Response: env.Response}, nil
+		if env.Status == envelopeDone {
+			return IdempotencyResult{Status: IdempotencyDone, Response: env.Response}, nil
+		}
+		return IdempotencyResult{Status: IdempotencyInProgress}, nil
 	}
-	return IdempotencyResult{Status: IdempotencyInProgress}, nil
+	// Сюда попадаем, только если ключ протухал между SETNX и GET
+	// beginRaceAttempts раз подряд — на практике это не гонка, а симптом
+	// (например, кто-то удаляет ключ принудительно), и прятать это за
+	// бесконечным повтором нельзя.
+	return IdempotencyResult{}, fmt.Errorf("redisx: begin %q: ключ исчезал между SETNX и GET %d раз подряд", key, beginRaceAttempts)
 }
 
 // Complete сохраняет готовый ответ операции, начатой через Begin.

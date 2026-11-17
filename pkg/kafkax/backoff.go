@@ -42,22 +42,14 @@ const (
 // потолок, детерминированный случай attempt<1), не поднимая ни консьюмера,
 // ни тем более Kafka.
 func Backoff(attempt int) time.Duration {
-	if attempt < 1 {
-		attempt = 1
-	}
+	attempt = max(attempt, 1)
 
 	// 1<<63 переполнил бы int64 уже на скромном attempt — потолок проверяем
 	// по количеству сдвигов, а не по результату умножения.
 	const maxShift = 20 // 200ms * 2^20 ≈ 58 часов, с огромным запасом выше backoffCap
-	shift := attempt - 1
-	if shift > maxShift {
-		shift = maxShift
-	}
+	shift := min(attempt-1, maxShift)
 
-	exp := backoffBase * time.Duration(uint64(1)<<uint(shift))
-	if exp > backoffCap {
-		exp = backoffCap
-	}
+	exp := min(backoffBase*time.Duration(uint64(1)<<uint(shift)), backoffCap)
 
 	// rand.Int64N паникует на n<=0; exp здесь всегда положителен (backoffBase>0).
 	return time.Duration(rand.Int64N(int64(exp) + 1))

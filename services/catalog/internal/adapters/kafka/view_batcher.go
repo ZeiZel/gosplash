@@ -80,6 +80,15 @@ const (
 	// путь чтения карточки, и он не должен ждать Kafka ни при каких
 	// обстоятельствах.
 	bufferCapacity = 4096
+
+	// publishTimeout — бюджет на ОДНО Publish внутри flush, а не на весь
+	// батч. Раньше один 10-секундный контекст делили до flushSize (200)
+	// ПОСЛЕДОВАТЕЛЬНЫХ синхронных Publish: застрявший брокер съедал бюджет
+	// первыми событиями, и все остальные уходили с уже истёкшим контекстом,
+	// не попытавшись ни разу. Персобытийный бюджет даёт каждому событию
+	// равный шанс; потеря тех, что не уложились, — тот же осознанный
+	// контракт «буфер просмотров можно терять» (см. комментарий пакета).
+	publishTimeout = 2 * time.Second
 )
 
 // ViewBatcher — реализация ports.ViewPublisher: буферизует PhotoViewed в
@@ -185,16 +194,18 @@ func (b *ViewBatcher) run() {
 // которое ходит в Kafka, и она делает это НЕ на пути чтения карточки —
 // путь чтения (Enqueue) не ждёт ни одного из этих Publish ни секунды.
 func (b *ViewBatcher) flush(batch []*eventsv1.PhotoViewed) []*eventsv1.PhotoViewed {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
 	for _, event := range batch {
 		env, err := kafkax.NewEnvelope(kafkax.EventPhotoViewed, event.GetPhotoId(), event)
 		if err != nil {
 			slog.Error("catalog: конверт analytics.photo.viewed", "error", err)
 			continue
 		}
-		if err := b.producer.Publish(ctx, kafkax.TopicPhotoViewed, env); err != nil {
+		// Контекст создаётся в каждой итерации цикла, поэтому cancel
+		// вручную, а не defer: defer внутри for копился бы до конца flush.
+		ctx, cancel := context.WithTimeout(context.Background(), publishTimeout)
+		err = b.producer.Publish(ctx, kafkax.TopicPhotoViewed, env)
+		cancel()
+		if err != nil {
 			// Ошибка публикации одного события аналитики не должна ронять
 			// весь батч и уж тем более процесс — см. комментарий пакета
 			// про допустимость потери части просмотров.

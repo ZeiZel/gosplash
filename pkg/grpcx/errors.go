@@ -2,6 +2,7 @@ package grpcx
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -38,10 +39,13 @@ type grpcStatusError interface {
 //     потеряло бы исходный код (например, подменило бы Unavailable на
 //     Internal) и исказило бы решение вызывающего о ретрае.
 //  2. err реализует DomainError — код берётся из него.
-//  3. иначе — codes.Internal: доменная ошибка без объявленного маппинга
-//     это баг (её забыли завести как DomainError), и маскировать его
-//     первым попавшимся кодом (например, Unknown) нельзя — Internal хотя бы
-//     явно говорит "здесь баг сервера", а не "проверьте свой запрос".
+//  3. иначе — codes.Internal со СТАТИЧЕСКИМ текстом "внутренняя ошибка
+//     сервера": доменная ошибка без объявленного маппинга это баг (её
+//     забыли завести как DomainError), и текст неопознанной ошибки может
+//     содержать детали инфраструктуры (CWE-209), поэтому клиент его не
+//     видит — оригинал уходит в slog.Error вместе с reason. Internal, а не
+//     Unknown: он явно говорит "здесь баг сервера", а не "проверьте свой
+//     запрос".
 func ToStatus(err error, reason string) error {
 	if err == nil {
 		return nil
@@ -53,12 +57,25 @@ func ToStatus(err error, reason string) error {
 	}
 
 	code := codes.Internal
-	var de DomainError
-	if errors.As(err, &de) {
+	msg := err.Error()
+	if de, ok := errors.AsType[DomainError](err); ok {
 		code = de.GRPCCode()
+	} else {
+		// Ошибка без маппинга — это баг (см. исход 3 выше), а текст бага
+		// может содержать что угодно: DSN, кусок SQL, путь на диске.
+		// Отдавать его клиенту — CWE-209 (раскрытие информации через
+		// сообщение об ошибке), поэтому наружу уходит статический текст,
+		// а оригинал — в лог вместе с reason, по которому запись можно
+		// связать с конкретным вызовом. Логируем здесь, а не в вызывающих
+		// адаптерах: ToStatus — единственная точка, через которую проходят
+		// ВСЕ неопознанные ошибки всех сервисов, и второго такого места,
+		// куда можно было бы поставить один лог, в проекте нет.
+		slog.Error("grpcx: ToStatus: ошибка без доменного маппинга, клиенту отдан статический текст",
+			"reason", reason, "error", err)
+		msg = "внутренняя ошибка сервера"
 	}
 
-	st := status.New(code, err.Error())
+	st := status.New(code, msg)
 	withDetails, detailErr := st.WithDetails(&errdetails.ErrorInfo{
 		Reason: reason,
 		Domain: "gosplash",

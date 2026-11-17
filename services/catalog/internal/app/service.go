@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"gosplash/services/catalog/internal/domain"
@@ -74,7 +75,11 @@ func (s *ListingService) recordView(ctx context.Context, listing *domain.Listing
 	if err := s.views.IncrView(ctx, listing.ID, now); err != nil {
 		// Кэш и счётчики — не источник правды: провалить запрос карточки
 		// из-за недоступного Redis было бы куда хуже, чем просто не
-		// посчитать один просмотр.
+		// посчитать один просмотр. Но и глотать ошибку молча нельзя —
+		// устойчиво недоступный Redis обязан быть виден в логах, а не
+		// выясняться по расхождению счётчиков постфактум.
+		slog.WarnContext(ctx, "catalog: не смог посчитать просмотр, счётчик пропущен",
+			"listing_id", listing.ID, "error", err)
 		return
 	}
 	s.pub.Enqueue(listing.ID, listing.AuthorID, viewerID, country)

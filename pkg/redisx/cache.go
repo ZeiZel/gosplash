@@ -65,9 +65,11 @@ func withJitter(ttl time.Duration) time.Duration {
 func GetOrLoadJSON[T any](ctx context.Context, c *Client, key string, ttl time.Duration, load func(context.Context) (T, error)) (T, error) {
 	var zero T
 
-	if v, ok, err := getJSON[T](ctx, c, key); err != nil {
+	v, ok, err := getJSON[T](ctx, c, key)
+	if err != nil {
 		return zero, err
-	} else if ok {
+	}
+	if ok {
 		c.recordHit(ctx, key)
 		return v, nil
 	}
@@ -88,14 +90,20 @@ func GetOrLoadJSON[T any](ctx context.Context, c *Client, key string, ttl time.D
 			// снова промахнётся. Логировать здесь нечем без контекста
 			// вызывающего сервиса, поэтому ошибку возвращает только Set,
 			// а не весь GetOrLoad.
-			return v, nil
+			return v, nil //nolint:nilerr // cache-aside: сбой записи в кэш не проваливает запрос (см. комментарий выше)
 		}
 		return v, nil
 	})
 	if err != nil {
 		return zero, err
 	}
-	return res.(T), nil
+	typed, ok := res.(T)
+	if !ok {
+		// Теоретически недостижимо (функция под Do возвращает T), но
+		// паника на сломанном инварианте дороже честной ошибки.
+		return zero, fmt.Errorf("redisx: singleflight: неожиданный тип %T для ключа %q", res, key)
+	}
+	return typed, nil
 }
 
 func getJSON[T any](ctx context.Context, c *Client, key string) (T, bool, error) {
@@ -162,14 +170,23 @@ func GetOrLoadProto[T any, PT protoPtr[T]](ctx context.Context, c *Client, key s
 			return nil, fmt.Errorf("redisx: proto.Marshal: %w", err)
 		}
 		if err := c.rdb.Set(ctx, key, data, withJitter(ttl)).Err(); err != nil {
-			return v, nil
+			// Тот же принцип cache-aside, что и в GetOrLoadJSON выше:
+			// значение уже загружено и валидно, сбой записи в кэш не
+			// проваливает запрос.
+			return v, nil //nolint:nilerr // cache-aside: сбой записи в кэш не проваливает запрос
 		}
 		return v, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return res.(PT), nil
+	typed, ok := res.(PT)
+	if !ok {
+		// Симметрично GetOrLoadJSON: недостижимо при корректном load, но
+		// панить на сломанном инварианте дороже честной ошибки.
+		return nil, fmt.Errorf("redisx: singleflight: неожиданный тип %T для ключа %q", res, key)
+	}
+	return typed, nil
 }
 
 // Invalidate удаляет ключи через UNLINK, а не DEL.

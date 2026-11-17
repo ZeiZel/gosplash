@@ -122,6 +122,12 @@ type Deps struct {
 	GRPCTimeout   time.Duration
 	PublicMethods []string
 
+	// GRPCReflectionEnabled — включить gRPC server reflection. Отдельный
+	// флаг, а не «всегда включено»: reflection отдаёт полный контракт
+	// сервиса без аутентификации, что удобно для grpcurl в локальной
+	// разработке и лишнее в проде (см. pkg/config.GRPCConfig).
+	GRPCReflectionEnabled bool
+
 	// Service — уже собранный сценарий (app.NewPhotoService). Собирается
 	// снаружи (в cmd/media или в тесте) именно потому, что для этого нужны
 	// ports.PhotoRepository и ports.ObjectStorage — в проде это pg+s3x,
@@ -224,8 +230,12 @@ func NewApp(deps Deps) (*App, error) {
 	mediav1.RegisterMediaServiceServer(grpcServer, mediagrpc.NewServer(deps.Service))
 	grpcHealth.Register(grpcServer)
 	// Reflection позволяет grpcurl вызывать методы без .proto-файла под
-	// рукой. В проде обычно выключают, локально — незаменимо.
-	reflection.Register(grpcServer)
+	// рукой. Регистрируется только по явному флагу конфигурации: по умолчанию
+	// выключена — она отдаёт контракт целиком без аутентификации, и в проде
+	// это лишняя поверхность атаки.
+	if deps.GRPCReflectionEnabled {
+		reflection.Register(grpcServer)
+	}
 
 	return &App{
 		serviceName: deps.ServiceName,

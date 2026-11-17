@@ -71,7 +71,13 @@ func NewServer(p ServerParams) *grpc.Server {
 // Serve запускает сервер на addr и блокирует вызывающую горутину — как
 // httpx.Serve, вызывать в go func().
 func Serve(server *grpc.Server, addr, name string) error {
-	listener, err := net.Listen("tcp", addr)
+	// net.Listen, а не ListenConfig.Listen(ctx): у Serve нет ctx-параметра,
+	// и это осознанно — bind сокета нечего отменять (реальное отключение
+	// потребителей делает Shutdown/GracefulStop), а пробросить ctx через
+	// сигнатуру значило бы поменять API всех семи bootstrap'ов ради строчки,
+	// где контекст всё равно был бы Background. В httpx та же роль играет
+	// server.ListenAndServe(), который ctx тоже не принимает.
+	listener, err := net.Listen("tcp", addr) //nolint:noctx // bind не отменяется контекстом; жизнь сервера управляется Shutdown (см. комментарий выше)
 	if err != nil {
 		return fmt.Errorf("grpcx: listen %s: %w", addr, err)
 	}

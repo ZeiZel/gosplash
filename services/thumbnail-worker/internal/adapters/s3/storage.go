@@ -95,8 +95,7 @@ func (c *Client) Ping(ctx context.Context, bucket string) error {
 }
 
 func isNoSuchKey(err error) bool {
-	var errResp minio.ErrorResponse
-	if errors.As(err, &errResp) {
+	if errResp, ok := errors.AsType[minio.ErrorResponse](err); ok {
 		return errResp.Code == "NoSuchKey"
 	}
 	// ToErrorResponse — задокументированный способ minio-go развернуть ЛЮБУЮ

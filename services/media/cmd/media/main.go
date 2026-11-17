@@ -111,11 +111,13 @@ func run() error {
 	// один по ключу: у relay нет ключа шардирования, он вычитывает то, что
 	// уже лежит неопубликованным, независимо от того, чьё это фото.
 	relay, err := outbox.New(outbox.Config{
-		ServiceName:  serviceName,
-		Brokers:      conf.Kafka.Brokers,
-		DSNs:         conf.Media.ShardDSNs,
-		PollInterval: conf.Outbox.PollInterval,
-		BatchSize:    conf.Outbox.BatchSize,
+		ServiceName:     serviceName,
+		Brokers:         conf.Kafka.Brokers,
+		DSNs:            conf.Media.ShardDSNs,
+		PollInterval:    conf.Outbox.PollInterval,
+		BatchSize:       conf.Outbox.BatchSize,
+		Retention:       conf.Outbox.Retention,
+		CleanupInterval: conf.Outbox.CleanupInterval,
 	})
 	if err != nil {
 		return err
@@ -169,6 +171,10 @@ func run() error {
 
 		JWTSecret:   conf.GRPC.JWTSecret,
 		GRPCTimeout: conf.GRPC.DefaultTimeout,
+		// Reflection — только по явному флагу (по умолчанию выключена):
+		// локально с grpcurl незаменима, в проде — раскрытие контракта
+		// без аутентификации.
+		GRPCReflectionEnabled: conf.GRPC.ReflectionEnabled,
 		// GetPhoto пока публичный: аутентификация запросов между сервисами
 		// (catalog → media) появится вместе с service-to-service токенами,
 		// это отдельная задача. Полное имя метода, а не аннотация в .proto —

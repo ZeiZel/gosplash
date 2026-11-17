@@ -36,3 +36,21 @@ func TestConfig_WithDefaults_OtritsatelnyeTozheZamenyayutsya(t *testing.T) {
 	assert.Positive(t, got.PollInterval)
 	assert.Positive(t, got.BatchSize)
 }
+
+func TestConfig_WithDefaults_ChistkaPodstavlyaetsyaRetentionNet(t *testing.T) {
+	// CleanupInterval ведёт себя как остальные «забыл задать»-поля...
+	cfg := Config{ServiceName: "media", Brokers: []string{"kafka:9092"}, DSNs: []string{"dsn"}}
+
+	got := cfg.withDefaults()
+
+	assert.Equal(t, DefaultConfig().CleanupInterval, got.CleanupInterval)
+	// ...а Retention — НЕ подставляется: его ноль означает «не чистить»,
+	// и молча превратить его в 7 дней значило бы лишить вызывающего
+	// способа выключить чистку (см. комментарий к полю).
+	assert.Zero(t, got.Retention)
+}
+
+func TestConfig_DefaultConfig_SemiDnyaCherezChas(t *testing.T) {
+	assert.Equal(t, 7*24*time.Hour, DefaultConfig().Retention)
+	assert.Equal(t, time.Hour, DefaultConfig().CleanupInterval)
+}

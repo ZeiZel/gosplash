@@ -3,7 +3,6 @@ package es
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,7 +48,7 @@ func TestBuildBulkBody(t *testing.T) {
 		require.True(t, ok, "первая строка обязана быть meta-объектом index")
 		assert.Equal(t, "listings", idx["_index"])
 		assert.Equal(t, "listing-1", idx["_id"])
-		assert.Equal(t, float64(1699999999000), idx["version"])
+		assert.InDelta(t, float64(1699999999000), idx["version"], 1e-9)
 		assert.Equal(t, "external_gte", idx["version_type"])
 
 		var doc map[string]any
@@ -90,6 +89,30 @@ func TestBuildBulkBody(t *testing.T) {
 		assert.Contains(t, lines[2], `"_id":"b"`)
 		assert.Contains(t, lines[3], `"_id":"c"`)
 	})
+}
+
+// TestBuildBulkBody_MetastrokiBaytVBajt фиксирует ТОЧНЫЕ байты мета-строк.
+//
+// Метаданные собираются статическими структурами с порядком полей как у
+// отсортированной карты — этот тест не даёт измениться проводу _bulk молча
+// (например, перестановкой полей в структуре или появлением omitempty у _id).
+func TestBuildBulkBody_MetastrokiBaytVBajt(t *testing.T) {
+	batch := []bulkAction{
+		{id: "a", version: 7, doc: domain.ListingDoc{ListingID: "a"}},
+		{isDelete: true, id: "b", version: 9},
+	}
+
+	body, err := buildBulkBody("listings", batch)
+	require.NoError(t, err)
+
+	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
+	require.Len(t, lines, 3, "index — две строки, delete — одна")
+	assert.JSONEq(t,
+		`{"index":{"_id":"a","_index":"listings","version":7,"version_type":"external_gte"}}`,
+		lines[0])
+	assert.JSONEq(t,
+		`{"delete":{"_id":"b","_index":"listings","version":9,"version_type":"external_gte"}}`,
+		lines[2])
 }
 
 func TestParseBulkResponse(t *testing.T) {
@@ -136,10 +159,10 @@ func TestParseBulkResponse(t *testing.T) {
 					assert.NoError(t, res, "элемент %d должен быть успешным", i)
 				}
 				if len(tt.wantPerm) > i && tt.wantPerm[i] {
-					assert.True(t, errors.Is(res, domain.ErrInvalidDocument), "элемент %d должен быть permanent", i)
+					assert.ErrorIs(t, res, domain.ErrInvalidDocument, "элемент %d должен быть permanent", i)
 				}
 				if len(tt.wantRetry) > i && tt.wantRetry[i] {
-					assert.True(t, errors.Is(res, domain.ErrIndexUnavailable), "элемент %d должен быть retryable", i)
+					assert.ErrorIs(t, res, domain.ErrIndexUnavailable, "элемент %d должен быть retryable", i)
 				}
 			}
 		})
@@ -216,7 +239,7 @@ func TestBulkIndexer_FlushPoRazmeru(t *testing.T) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -265,7 +288,7 @@ func TestBulkIndexer_MapperException_Permanent(t *testing.T) {
 
 	err := indexer.IndexListing(context.Background(), domain.ListingDoc{ListingID: "bad"}, 1)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, domain.ErrInvalidDocument))
+	assert.ErrorIs(t, err, domain.ErrInvalidDocument)
 }
 
 func TestBulkIndexer_ClusterNedostupen_Retryable(t *testing.T) {
@@ -278,5 +301,5 @@ func TestBulkIndexer_ClusterNedostupen_Retryable(t *testing.T) {
 
 	err := indexer.IndexListing(context.Background(), domain.ListingDoc{ListingID: "x"}, 1)
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, domain.ErrIndexUnavailable))
+	assert.ErrorIs(t, err, domain.ErrIndexUnavailable)
 }

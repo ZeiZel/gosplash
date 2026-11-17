@@ -66,6 +66,14 @@ type AnalyticsConfig struct {
 	ViewBatchFlushInterval     time.Duration
 	PurchaseBatchSize          int
 	PurchaseBatchFlushInterval time.Duration
+	// События воронки (uploads, thumbnails) редкие, как покупки: загрузка —
+	// осознанное действие человека, а не просмотр карточки. Поэтому им те же
+	// малые пределы, что покупкам, а не просмотровые — иначе редкий поток
+	// набирал бы пачку дольше, чем живёт само событие.
+	UploadBatchSize             int
+	UploadBatchFlushInterval    time.Duration
+	ThumbnailBatchSize          int
+	ThumbnailBatchFlushInterval time.Duration
 }
 
 type ClickHouseConfig struct {
@@ -135,6 +143,12 @@ type GRPCConfig struct {
 	// не прислал свой. Без него запрос от клиента без дедлайна может висеть
 	// вечно, занимая горутину и соединение.
 	DefaultTimeout time.Duration
+
+	// ReflectionEnabled — gRPC server reflection. Выключен по умолчанию:
+	// reflection раскрывает ПОЛНЫЙ контракт сервиса (все методы, все
+	// схемы) без аутентификации — удобно локально с grpcurl, в проде —
+	// лишняя поверхность атаки.
+	ReflectionEnabled bool
 }
 
 // MediaConfig — media-сервис, шардированное хранилище.
@@ -202,6 +216,13 @@ type ThumbnailConfig struct {
 type OutboxConfig struct {
 	PollInterval time.Duration
 	BatchSize    int
+	// Retention — сколько жить ОПУБЛИКОВАННЫМ строкам outbox: relay
+	// периодически удаляет старее (см. maybeCleanup в pkg/outbox/relay.go).
+	// Без чистки таблица растёт бесконечно, а count(*) в outbox_pending
+	// деградирует. НОЛЬ чистку выключает — осознанный выбор, а не «забыл».
+	Retention time.Duration
+	// CleanupInterval — как часто (самое большее) запускать чистку.
+	CleanupInterval time.Duration
 }
 
 type KafkaConfig struct {
@@ -291,8 +312,10 @@ func Load() *Config {
 			LockTTL:     duration("THUMBNAIL_LOCK_TTL", 30*time.Second),
 		},
 		Outbox: OutboxConfig{
-			PollInterval: duration("OUTBOX_POLL_INTERVAL", time.Second),
-			BatchSize:    integer("OUTBOX_BATCH_SIZE", 100),
+			PollInterval:    duration("OUTBOX_POLL_INTERVAL", time.Second),
+			BatchSize:       integer("OUTBOX_BATCH_SIZE", 100),
+			Retention:       duration("OUTBOX_RETENTION", 7*24*time.Hour),
+			CleanupInterval: duration("OUTBOX_CLEANUP_INTERVAL", time.Hour),
 		},
 		Kafka: KafkaConfig{
 			Brokers:        strings.Split(env("KAFKA_BROKERS", "localhost:59094"), ","),
@@ -338,11 +361,15 @@ func Load() *Config {
 				DialTimeout: duration("CLICKHOUSE_DIAL_TIMEOUT", 5*time.Second),
 				ReadTimeout: duration("CLICKHOUSE_READ_TIMEOUT", 30*time.Second),
 			},
-			KafkaConsumerGroup:         env("KAFKA_CONSUMER_GROUP_ANALYTICS", "analytics"),
-			ViewBatchSize:              integer("ANALYTICS_CH_BATCH_SIZE", 1000),
-			ViewBatchFlushInterval:     duration("ANALYTICS_CH_FLUSH_INTERVAL", 5*time.Second),
-			PurchaseBatchSize:          integer("ANALYTICS_CH_PURCHASE_BATCH_SIZE", 100),
-			PurchaseBatchFlushInterval: duration("ANALYTICS_CH_PURCHASE_FLUSH_INTERVAL", 5*time.Second),
+			KafkaConsumerGroup:          env("KAFKA_CONSUMER_GROUP_ANALYTICS", "analytics"),
+			ViewBatchSize:               integer("ANALYTICS_CH_BATCH_SIZE", 1000),
+			ViewBatchFlushInterval:      duration("ANALYTICS_CH_FLUSH_INTERVAL", 5*time.Second),
+			PurchaseBatchSize:           integer("ANALYTICS_CH_PURCHASE_BATCH_SIZE", 100),
+			PurchaseBatchFlushInterval:  duration("ANALYTICS_CH_PURCHASE_FLUSH_INTERVAL", 5*time.Second),
+			UploadBatchSize:             integer("ANALYTICS_CH_UPLOAD_BATCH_SIZE", 100),
+			UploadBatchFlushInterval:    duration("ANALYTICS_CH_UPLOAD_FLUSH_INTERVAL", 5*time.Second),
+			ThumbnailBatchSize:          integer("ANALYTICS_CH_THUMBNAIL_BATCH_SIZE", 100),
+			ThumbnailBatchFlushInterval: duration("ANALYTICS_CH_THUMBNAIL_FLUSH_INTERVAL", 5*time.Second),
 		},
 		Search: SearchConfig{
 			Addrs:              strings.Split(env("ELASTICSEARCH_ADDRS", "http://localhost:59200"), ","),
@@ -362,8 +389,9 @@ func Load() *Config {
 			ReadTimeout: duration("REDIS_READ_TIMEOUT", 500*time.Millisecond),
 		},
 		GRPC: GRPCConfig{
-			JWTSecret:      env("JWT_SECRET", ""),
-			DefaultTimeout: duration("GRPC_DEFAULT_TIMEOUT", 5*time.Second),
+			JWTSecret:         env("JWT_SECRET", ""),
+			DefaultTimeout:    duration("GRPC_DEFAULT_TIMEOUT", 5*time.Second),
+			ReflectionEnabled: env("GRPC_REFLECTION_ENABLED", "false") == "true",
 		},
 		Observe: ObserveConfig{
 			OTLPEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:54317"),

@@ -300,10 +300,19 @@ proto-clean: ## удалить сгенерированный код
 # В режиме workspace `go build ./...` из корня не видит пакеты подмодулей:
 # паттерн ./... раскрывается только внутри одного модуля. Поэтому все
 # go-цели обходят модули по списку.
+#
+# Список НЕ генерируется из go.work автоматически (хотя CI в
+# .github/workflows/ci.yml делает именно так): философия этого Makefile —
+# явность, каждый новый модуль добавляется сюда осознанным решением.
+# Обратная сторона: список обязан оставаться синхронным с go.work, иначе
+# make test/lint/coverage молча пропускают модули, которые CI проверяет
+# (ровно это случилось с tools/archcheck и tools/search-reindex — их
+# добавили в go.work, но не сюда, и ci-local не замечал их регрессий).
 MODULES := . \
            services/media services/catalog services/wallet services/order \
            services/thumbnail-worker services/analytics services/search \
-           tools/automigrate tools/mediactl tools/kafka-reprocess
+           tools/archcheck tools/automigrate tools/kafka-reprocess \
+           tools/mediactl tools/search-reindex
 
 # Что собирать в ./build — только то, у чего есть main. Формат элемента —
 # имя-бинарника=путь-к-cmd, а не просто путь: для большинства пар имя и так
@@ -340,7 +349,7 @@ tidy: ## go mod tidy во всех модулях + go work sync
 	@for m in $(MODULES); do echo "→ $$m"; (cd $$m && go mod tidy) || exit 1; done
 	go work sync
 
-.PHONY: fmt vet build build-linux test test-cover lint
+.PHONY: fmt vet build build-linux test test-race test-cover lint
 fmt: ## gofmt всего дерева
 	gofmt -l -w .
 vet: ## go vet по всем модулям
@@ -379,6 +388,8 @@ build-linux: ## собрать все бинарники под linux/<arch> в 
 	done
 test: ## прогнать тесты во всех модулях
 	@for m in $(MODULES); do (cd $$m && go test ./... -count=1) || exit 1; done
+test-race: ## тесты с детектором гонок по всем модулям (локально нужен gcc: -race требует CGO; CI уже гоняет -race на Linux)
+	@for m in $(MODULES); do (cd $$m && go test ./... -race -count=1) || exit 1; done
 test-cover: ## тесты с покрытием (по модулям)
 	@for m in $(MODULES); do \
 		printf "%-30s" $$m; \
@@ -388,12 +399,12 @@ lint: ## golangci-lint (нужен make tools)
 	@for m in $(MODULES); do (cd $$m && golangci-lint run ./...) || exit 1; done
 
 .PHONY: tools
-tools: ## поставить buf, плагины protoc и линтер
-	go install github.com/bufbuild/buf/cmd/buf@latest
-	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+tools: ## поставить buf, плагины protoc и линтер (версии запинены = CI)
+	go install github.com/bufbuild/buf/cmd/buf@1.50.0
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
 	go install github.com/grpc-ecosystem/grpc-gateway/v2/cmd/protoc-gen-grpc-gateway@latest
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 	@echo "Убедись, что $$(go env GOPATH)/bin есть в PATH"
 
 # ─────────────────────────────────────────────────────────────────────────────

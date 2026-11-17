@@ -16,7 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/google/uuid"
+	"uuid"
 
 	"gosplash/services/wallet/internal/domain"
 	"gosplash/services/wallet/internal/ports"
@@ -50,12 +50,9 @@ func newID() string {
 	// uuid.NewV7, а не v4: первые 48 бит — unix-время, вставка в PRIMARY
 	// KEY (reservations.id, ledger_entries.id) идёт в «правый край»
 	// B-tree, как и везде в проекте (см. pkg/outbox/model.go, тот же
-	// довод). Если по какой-то причине V7 недоступен — тот же безопасный
-	// фолбэк, что и в остальном коде.
-	if id, err := uuid.NewV7(); err == nil {
-		return id.String()
-	}
-	return uuid.NewString()
+	// довод). Стандартный uuid.NewV7 ошибки не возвращает (в отличие
+	// от github.com/google/uuid), поэтому фолбэк на v4 больше не нужен.
+	return uuid.NewV7().String()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -91,9 +88,11 @@ func (s *Service) Reserve(ctx context.Context, accountID int64, amount domain.Mo
 		// available_after, а не пересчитываем его заново — к моменту
 		// повтора баланс мог измениться другими операциями, а правило
 		// идемпотентности требует вернуть тот же ответ, что и в первый раз.
-		if existing, err := tx.FindReservationByIdempotencyKey(ctx, key); err != nil {
+		existing, err := tx.FindReservationByIdempotencyKey(ctx, key)
+		if err != nil {
 			return err
-		} else if existing != nil {
+		}
+		if existing != nil {
 			reservation = existing
 			availableAfter = existing.AvailableAfterCents
 			return nil
@@ -182,9 +181,11 @@ func (s *Service) Commit(ctx context.Context, reservationID string, payeeAccount
 	var ledgerEntryIDs []string
 
 	err := s.store.WithinTx(ctx, func(tx ports.TxStore) error {
-		if raw, found, err := tx.FindOperation(ctx, key, ports.OperationCommit); err != nil {
+		raw, found, err := tx.FindOperation(ctx, key, ports.OperationCommit)
+		if err != nil {
 			return err
-		} else if found {
+		}
+		if found {
 			var res commitResult
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return fmt.Errorf("wallet: разбор сохранённого результата commit: %w", err)
@@ -354,9 +355,11 @@ func (s *Service) Release(ctx context.Context, reservationID, reason, key string
 	var result domain.Money
 
 	err := s.store.WithinTx(ctx, func(tx ports.TxStore) error {
-		if raw, found, err := tx.FindOperation(ctx, key, ports.OperationRelease); err != nil {
+		raw, found, err := tx.FindOperation(ctx, key, ports.OperationRelease)
+		if err != nil {
 			return err
-		} else if found {
+		}
+		if found {
 			var res releaseResult
 			if err := json.Unmarshal(raw, &res); err != nil {
 				return fmt.Errorf("wallet: разбор сохранённого результата release: %w", err)

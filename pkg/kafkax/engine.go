@@ -158,7 +158,17 @@ func (e *partitionEngine) dispatch(fetches kgo.Fetches) {
 			// offset для неё не закоммичен, и её получит новый владелец.
 			return
 		}
-		w.recs <- p.Records
+		// Отправка может надолго занять горутину Run, если буфер канала полон
+		// (воркер застрял в backoff'е) — поэтому ждём её вместе с отменой ctx:
+		// при остановке сервиса Run не должен стоять здесь до 30с (backoffCap),
+		// а следом — AllowRebalance и Close. Запись при этом не теряется по
+		// той же причине, что и выше: offset не закоммичен, и её заберёт
+		// новый владелец партиции.
+		select {
+		case w.recs <- p.Records:
+		case <-e.ctx.Done():
+			return
+		}
 	})
 }
 

@@ -115,7 +115,7 @@ func newUploadRequest(t *testing.T, userID, filename string, content []byte) *ht
 	require.NoError(t, err)
 	require.NoError(t, w.Close())
 
-	req := httptest.NewRequest(http.MethodPost, "/media/upload", body)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/media/upload", body)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	req.Header.Set("X-User-Id", userID)
 	return req
@@ -211,7 +211,7 @@ func TestDelete_Uspeshno(t *testing.T) {
 
 	router := newTestRouter(Deps{Service: service, MaxBodyBytes: 1 << 20})
 
-	req := httptest.NewRequest(http.MethodDelete, "/media/photos/photo-1?user_id=1", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, "/media/photos/photo-1?user_id=1", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -225,7 +225,7 @@ func TestDelete_NeNaydeno(t *testing.T) {
 
 	router := newTestRouter(Deps{Service: service, MaxBodyBytes: 1 << 20})
 
-	req := httptest.NewRequest(http.MethodDelete, "/media/photos/photo-1?user_id=1", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, "/media/photos/photo-1?user_id=1", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -236,7 +236,7 @@ func TestDelete_BezUserID(t *testing.T) {
 	service := app.NewPhotoService(&fakePhotoRepo{}, &fakeObjectStorage{}, "originals")
 	router := newTestRouter(Deps{Service: service, MaxBodyBytes: 1 << 20})
 
-	req := httptest.NewRequest(http.MethodDelete, "/media/photos/photo-1", nil)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, "/media/photos/photo-1", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 

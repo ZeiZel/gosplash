@@ -102,11 +102,13 @@ func run() error {
 	// DSN один (не шарды, см. выше) — тот же самый, на который пишет
 	// CommitFunds внутри своей транзакции.
 	relay, err := outbox.New(outbox.Config{
-		ServiceName:  serviceName,
-		Brokers:      conf.Kafka.Brokers,
-		DSNs:         []string{walletConf.DSN},
-		PollInterval: conf.Outbox.PollInterval,
-		BatchSize:    conf.Outbox.BatchSize,
+		ServiceName:     serviceName,
+		Brokers:         conf.Kafka.Brokers,
+		DSNs:            []string{walletConf.DSN},
+		PollInterval:    conf.Outbox.PollInterval,
+		BatchSize:       conf.Outbox.BatchSize,
+		Retention:       conf.Outbox.Retention,
+		CleanupInterval: conf.Outbox.CleanupInterval,
 	})
 	if err != nil {
 		return fmt.Errorf("wallet: outbox relay: %w", err)

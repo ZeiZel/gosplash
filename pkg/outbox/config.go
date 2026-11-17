@@ -33,6 +33,20 @@ type Config struct {
 	// чем нужно, мешая другому релею того же шарда SKIP LOCKED'ом обойти
 	// эти строки стороной, но не мешая писать НОВЫЕ строки бизнес-коду.
 	BatchSize int
+
+	// Retention — сколько жить опубликованным строкам: старше этого
+	// возраста relay удаляет (см. maybeCleanup в relay.go). DefaultConfig
+	// даёт 7 дней; НОЛЬ — чистка выключена, таблица растёт, и забота
+	// о ней возвращается вызывающему. Поэтому withDefaults это поле НЕ
+	// подставляет: ноль здесь — осмысленный выбор «не удалять», а не
+	// «забыл задать», и отличить одно от другого невозможно.
+	Retention time.Duration
+
+	// CleanupInterval — как часто (самое большее) запускать чистку.
+	// Проверка происходит после успешной публикации батча, поэтому чистка
+	// СЕРВИСА, в котором событий нет, сама собой не запускается — но этому
+	// коду и нечего чистить: его таблица не растёт.
+	CleanupInterval time.Duration
 }
 
 // DefaultConfig — разумные значения для локальной разработки и тестов.
@@ -40,14 +54,19 @@ type Config struct {
 // быть заданы вызывающим.
 func DefaultConfig() Config {
 	return Config{
-		PollInterval: 2 * time.Second,
-		BatchSize:    100,
+		PollInterval:    2 * time.Second,
+		BatchSize:       100,
+		Retention:       7 * 24 * time.Hour,
+		CleanupInterval: time.Hour,
 	}
 }
 
 // withDefaults подставляет DefaultConfig() там, где вызывающий оставил
 // нулевое значение — так New(cfg) не падает на "PollInterval: 0", то есть
 // на релей, до предела нагружающий и Postgres, и Kafka пустыми SELECT'ами.
+// Retention — исключение: его ноль означает «не чистить» (см. комментарий
+// к полю), и подставлять туда дефолт значило бы лишить вызывающего способа
+// выключить чистку.
 func (c Config) withDefaults() Config {
 	d := DefaultConfig()
 	if c.PollInterval <= 0 {
@@ -55,6 +74,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = d.BatchSize
+	}
+	if c.CleanupInterval <= 0 {
+		c.CleanupInterval = d.CleanupInterval
 	}
 	return c
 }

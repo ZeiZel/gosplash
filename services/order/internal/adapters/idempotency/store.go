@@ -23,6 +23,11 @@
 // сам по себе, если ключ найден). Платим за это лишним походом в PostgreSQL
 // ровно в тех случаях, когда Redis не может дать однозначный ответ, — не
 // на каждый запрос.
+//
+// Строки в PostgreSQL тоже подчиняются TTL: in_progress старше TTL считается
+// протухшим (держатель погиб между Begin и Complete) и может быть перезанят,
+// done-строки и совсем старые in_progress удаляются спустя TTL + день запаса
+// (см. beginPG, cleanupExpired и «Обновление» в docs/adr/0018-*.md).
 package idempotency
 
 import (
@@ -45,6 +50,13 @@ type Store struct {
 	db    *gorm.DB
 	ttl   time.Duration
 }
+
+// expiredRetention — запас сверх TTL, в течение которого строка живёт
+// в PostgreSQL ПОСЛЕ того, как её Redis-копия уже обязана была истечь.
+// Повтор, опоздавший к Redis-ключу на секунды, ещё получает сохранённый
+// ответ из источника правды; спустя TTL+retention строка удаляется —
+// таблица не растёт бесконечно, а ключ для Redis и так уже «новый».
+const expiredRetention = 24 * time.Hour
 
 func New(redis *redisx.Client, db *gorm.DB, ttl time.Duration) *Store {
 	if ttl <= 0 {
@@ -93,6 +105,34 @@ func (s *Store) Complete(ctx context.Context, key string, response []byte) error
 	if err := s.redis.Complete(ctx, s.redis.Key("idempotency", key), response, s.ttl); err != nil {
 		slog.WarnContext(ctx, "idempotency: не удалось обновить redis", "error", err)
 	}
+
+	// Чистка старых строк «на плечах» Complete, а не отдельным тикером:
+	// Complete и так случается на каждый созданный заказ, лишний
+	// планировщик ради одного DELETE был бы больше кода, чем сама чистка.
+	// Провал чистки не проваливает Complete — операция уже завершена,
+	// таблицу подметёт следующее завершение (см. cleanupExpired).
+	if err := s.cleanupExpired(ctx); err != nil {
+		slog.WarnContext(ctx, "idempotency: не удалось удалить старые ключи из postgres", "error", err)
+	}
+	return nil
+}
+
+// cleanupExpired удаляет строки старше TTL + expiredRetention: завершённые
+// (done) — по updated_at (момент завершения), застрявшие (in_progress) —
+// по created_at (момент занятия). Грань та же, что и у занятия в beginPG:
+// дольше TTL ключ в Redis всё равно не живёт, значит повтор по прошествии
+// TTL+retention — уже «новая операция» и с точки зрения быстрого пути, и
+// с точки зрения источника правды; хранить её дольше — только расти
+// таблице без пользы.
+func (s *Store) cleanupExpired(ctx context.Context) error {
+	cutoff := time.Now().Add(-(s.ttl + expiredRetention))
+	err := s.db.WithContext(ctx).
+		Where("status = ? AND updated_at < ?", pg.IdempotencyStatusDone, cutoff).
+		Or("status = ? AND created_at < ?", pg.IdempotencyStatusInProgress, cutoff).
+		Delete(&pg.IdempotencyKeyRow{}).Error
+	if err != nil {
+		return fmt.Errorf("idempotency: удаление старых ключей: %w", err)
+	}
 	return nil
 }
 
@@ -125,6 +165,37 @@ func (s *Store) beginPG(ctx context.Context, key string) (ports.IdempotencyResul
 			slog.WarnContext(ctx, "idempotency: не удалось прогреть redis после расхождения с postgres", "error", err)
 		}
 		return ports.IdempotencyResult{Status: ports.IdempotencyDone, Response: existing.Response}, nil
+	}
+
+	// in_progress: либо ЖИВОЙ параллельный вызов (ему — 409), либо след
+	// процесса, упавшего между Begin и Complete: в Redis такой ключ истёк
+	// бы по TTL, а авторитетная строка в PostgreSQL жила вечно (см. ADR
+	// 0018, «известное ограничение»). Протухшим считаем in_progress, чья
+	// эпоха занятия (created_at) старше того же TTL, что живёт Redis-копия.
+	// Протухший ключ можно ПЕРЕЗАнять — атомарным UPDATE с тем же условием
+	// в WHERE: из конкурентных повторов выиграет ровно один, остальные
+	// увидят уже обновлённый created_at и получат RowsAffected=0 (тот же
+	// приём «страж в WHERE», что ON CONFLICT у INSERT выше). Риск отнять
+	// ключ у живого, но медленного запроса не выше, чем в Redis: TTL и там
+	// не спрашивает держателя, завершился ли он.
+	now := time.Now()
+	claim := s.db.WithContext(ctx).Model(&pg.IdempotencyKeyRow{}).
+		Where("key = ? AND status = ? AND created_at < ?",
+			key, pg.IdempotencyStatusInProgress, now.Add(-s.ttl)).
+		Updates(map[string]any{
+			"status":     pg.IdempotencyStatusInProgress,
+			"response":   nil,
+			"created_at": now,
+			"updated_at": now,
+		})
+	if claim.Error != nil {
+		return ports.IdempotencyResult{}, fmt.Errorf("idempotency: перезанятие протухшего ключа в postgres: %w", claim.Error)
+	}
+	if claim.RowsAffected == 1 {
+		// Ключ перезанят НАМИ: для вызывающего это обычный «свободно» —
+		// прошлая попытка до Complete не дожила, операцию нужно выполнить
+		// (и её Complete зафиксирует ответ уже для нас).
+		return ports.IdempotencyResult{Status: ports.IdempotencyFree}, nil
 	}
 	return ports.IdempotencyResult{Status: ports.IdempotencyInProgress}, nil
 }

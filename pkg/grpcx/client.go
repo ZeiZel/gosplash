@@ -38,7 +38,7 @@ func WithKeepalive(p keepalive.ClientParameters) DialOption {
 // Если метод дергает несколько разных RPC с разной идемпотентностью
 // (например, GetBalance и CommitFunds), это повод завести ДВА разных
 // *grpc.ClientConn с разными Dial-опциями, а не один клиент "на всякий
-// случай неидемпотентный": иначе идемпотентные чтения platят задержкой
+// случай неидемпотентный": иначе идемпотентные чтения платят задержкой
 // ретраев наравне с записями, для которых ретраи вообще запрещены.
 func WithRetry(cfg resilience.RetryConfig, idempotency resilience.Idempotency) DialOption {
 	return func(c *dialConfig) {

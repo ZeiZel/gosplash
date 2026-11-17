@@ -2,6 +2,7 @@ package temporal
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"go.temporal.io/sdk/log"
@@ -220,8 +221,8 @@ func failOrder(ctx workflow.Context, logger log.Logger, orderID string, cause er
 			logger.Error("не удалось отметить заказ как compensating", "order_id", orderID, "error", err.Error())
 		}
 
-		for i := len(compensations) - 1; i >= 0; i-- {
-			if err := compensations[i](ctx); err != nil {
+		for _, compensate := range slices.Backward(compensations) {
+			if err := compensate(ctx); err != nil {
 				// criticalActivityOptions даёт неограниченные попытки без
 				// ScheduleToCloseTimeout — на практике эта ветка достижима
 				// только через отмену воркфлоу целиком. Раз сама

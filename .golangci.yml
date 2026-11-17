@@ -57,7 +57,67 @@ linters:
     - gocritic # диагностики багов и производительности (диагностические
     # теги ниже — только opinionated и performance, не style — см. settings)
 
+    # ─── Тесты (testify) ───────────────────────────────────────────────
+    - testifylint # анти-паттерны testify: assert.True(t, errors.Is(...))
+    # вместо assert.ErrorIs (слабое сообщение об ошибке, невозможность
+    # использовать msgAndArgs по назначению), require внутри горутины,
+    # assert.NoError там, где по стилю нужен require. Настройки ниже
+    # оставляют активными именно error-is-as и go-require — проверками,
+    # ради которых линтер включён
+    - thelper # у тестового хелпера нет t.Helper() — и строка падения
+    # указывает на хелпер, а не на тест, который его вызвал; в этом
+    # репозитории хелперы строят окружение (newFakeStore, uploadedEnvelope),
+    # и без t.Helper() стек в падении бесполезен
+
+    # ─── Аудит фазы 6: точечные проверки опасных конструкций ───────────
+    - nilerr # return nil внутри if err != nil — ошибка проверена и молча
+    # потеряна; почти всегда это забытая передача err наверх
+    - forcetypeassert # x.(T) без `, ok` — паника на неожиданном типе
+    # в рантайме; в обработчиках Kafka-событий это падение консьюмера
+    - noctx # http.NewRequest без context — запрос без дедлайна и без
+    # трейса, STYLE.md прямо требует "всегда с контекстом"
+    - durationcheck # умножение time.Duration на time.Duration — единицы
+    # смешиваются (секунды в квадрате), классика тихих багов таймеров
+    - nolintlint # //nolint без пояснения — подавление живёт дольше причины:
+    # требует машинно-читаемую причину после `//`
+    - usetesting # тест-специфичные замены (os.Setenv → t.Setenv и т.п.);
+    # context-проверки выключены в настройках ниже — см. комментарий там
+    - modernize # механические модернизации stdlib (min/max, slices.Contains,
+    # for range int) — там, где код становится короче И яснее
+
   settings:
+    testifylint:
+      # require-error выключен: документированный стиль проекта (см.
+      # docs/STYLE.md "Тесты" и существующие *_test.go) — assert для
+      # ПРОВЕРОК предположений внутри теста и require только для
+      # предпосылок, без которых тест бессмыслен (NoError после создания
+      # окружения). testifylint же требует require ВСЕГДА, когда дальше
+      # по коду есть обращения к результату, и заливает десятками
+      # находок, противоречащих этому правилу. Остальные проверки
+      # (error-is-as, go-require, expected-actual, float-compare...)
+      # остаются активными — это то, ради чего линтер включён.
+      disable:
+        - require-error
+
+    usetesting:
+      # context-background/context-todo выключены: t.Context() отменяется
+      # в Cleanup теста, а в этом репозитории 225 вызовов context.Background()
+      # в тестах, значительная часть — в хелперах/горутинах, переживающих
+      # сам тест (движки kafkax, watchdog'и redisx, batcher clickhouse).
+      # Массовая замена на t.Context() — это не механический рефакторинг,
+      # а изменение семантики отмены каждого теста. Остальные проверки
+      # usetesting (os-setenv, os-mkdir-temp, os-create-temp...) активны.
+      context-background: false
+      context-todo: false
+
+    nolintlint:
+      # //nolint без пояснения и без имени линтера живёт дольше причины, по
+      # которой его поставили: require-explanation заставляет писать ЧТО
+      # подавлено и зачем, require-specific — именовать конкретный линтер
+      # вместо blanket-//nolint, который молча глушит и будущие находки.
+      require-explanation: true
+      require-specific: true
+
     errcheck:
       # defer resp.Body.Close() / rows.Close() после того как тело/строки уже
       # прочитаны, а код ошибки закрытия ни на что не влияет, — в проекте
@@ -245,6 +305,15 @@ linters:
       - path: cmd/
         linters: [errcheck]
         text: "Error return value of `.*\\.Close` is not checked"
+
+issues:
+  # 0 = без потолка: скрытые лимитом находки создают ложное "ноль проблем"
+  # (первые N дубликатов видны, остальные молча съедаются) — на этапе
+  # доведения репозитория до нуля это прямая помеха. Совпадения
+  # (max-same-issues) тоже не сворачиваем: 40 одинаковых t.Helper() —
+  # это 40 реальных мест, а не одна.
+  max-issues-per-linter: 0
+  max-same-issues: 0
 
 formatters:
   # gofmt отдельно проверяется в CI шагом `gofmt -l` (см. .github/workflows/ci.yml)

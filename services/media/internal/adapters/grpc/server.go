@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	mediav1 "gosplash/gen/go/gosplash/media/v1"
+	"gosplash/pkg/grpcx"
 	"gosplash/services/media/internal/app"
 	"gosplash/services/media/internal/domain"
 )
@@ -41,10 +42,16 @@ func (s *Server) GetPhoto(ctx context.Context, req *mediav1.GetPhotoRequest) (*m
 
 	photo, err := s.service.Get(ctx, req.GetUserId(), req.GetId())
 	if errors.Is(err, domain.ErrNotFound) {
+		// NotFound отдельно и ДО ToStatus: "не найдено" — ожидаемый,
+		// адресованный клиенту ответ с известным кодом, а не неопознанная
+		// ошибка (тот же приём, что и в wallet-адаптере).
 		return nil, status.Error(codes.NotFound, "фото не найдено")
 	}
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		// ToStatus вместо status.Error(..., err.Error()): текст неожиданной
+		// ошибки может содержать детали инфраструктуры (CWE-209), ToStatus
+		// отдаёт клиенту статическое сообщение и логирует оригинал.
+		return nil, grpcx.ToStatus(err, "PHOTO_GET_FAILED")
 	}
 
 	return &mediav1.GetPhotoResponse{Photo: toProto(photo, s.service.ShardOf(photo.UserID))}, nil
