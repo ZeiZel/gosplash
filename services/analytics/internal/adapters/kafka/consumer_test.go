@@ -36,9 +36,29 @@ func (f *fakePurchaseSink) Add(_ context.Context, p domain.Purchase) error {
 	return f.err
 }
 
+type fakeUploadSink struct {
+	added []domain.Upload
+	err   error
+}
+
+func (f *fakeUploadSink) Add(_ context.Context, u domain.Upload) error {
+	f.added = append(f.added, u)
+	return f.err
+}
+
+type fakeThumbnailSink struct {
+	added []domain.Thumbnail
+	err   error
+}
+
+func (f *fakeThumbnailSink) Add(_ context.Context, th domain.Thumbnail) error {
+	f.added = append(f.added, th)
+	return f.err
+}
+
 func TestHandlePhotoViewed_RazbiraetKonvertIZovyotIngest(t *testing.T) {
 	views := &fakeViewSink{}
-	c := &Consumers{ingest: app.NewIngest(views, &fakePurchaseSink{})}
+	c := &Consumers{ingest: app.NewIngest(views, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
 
 	env, err := kafkax.NewEnvelope(kafkax.EventPhotoViewed, "photo-1", &eventsv1.PhotoViewed{
 		PhotoId:  "photo-1",
@@ -59,7 +79,7 @@ func TestHandlePhotoViewed_RazbiraetKonvertIZovyotIngest(t *testing.T) {
 }
 
 func TestHandlePhotoViewed_BityyPayloadPostoyannayaOshibka(t *testing.T) {
-	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{})}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
 
 	// Конверт с payload ДРУГОГО типа — типичный сценарий "не тот event_type
 	// приехал в топик": anypb.UnmarshalTo обязан вернуть ошибку, а не молча
@@ -74,7 +94,7 @@ func TestHandlePhotoViewed_BityyPayloadPostoyannayaOshibka(t *testing.T) {
 }
 
 func TestHandlePhotoViewed_PustoyPayloadPostoyannayaOshibka(t *testing.T) {
-	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{})}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
 
 	env := &eventsv1.Envelope{
 		EventId:     "evt-1",
@@ -91,7 +111,7 @@ func TestHandlePhotoViewed_PustoyPayloadPostoyannayaOshibka(t *testing.T) {
 
 func TestHandleOrderPaid_ListingIdStanovitsyaPhotoID(t *testing.T) {
 	purchases := &fakePurchaseSink{}
-	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, purchases)}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, purchases, &fakeUploadSink{}, &fakeThumbnailSink{})}
 
 	env, err := kafkax.NewEnvelope(kafkax.EventOrderPaid, "order-1", &eventsv1.OrderPaid{
 		OrderId:    "order-1",
@@ -112,7 +132,7 @@ func TestHandleOrderPaid_ListingIdStanovitsyaPhotoID(t *testing.T) {
 }
 
 func TestHandleOrderPaid_ChuzhoyPayloadPostoyannayaOshibka(t *testing.T) {
-	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{})}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
 
 	env, err := kafkax.NewEnvelope(kafkax.EventPhotoViewed, "photo-1", &eventsv1.PhotoViewed{PhotoId: "photo-1"})
 	require.NoError(t, err)
@@ -121,4 +141,129 @@ func TestHandleOrderPaid_ChuzhoyPayloadPostoyannayaOshibka(t *testing.T) {
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, kafkax.ErrPermanent)
+}
+
+func TestHandleOrderPaid_PustoyOrderIDPostoyannayaOshibka(t *testing.T) {
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
+
+	// Пустой order_id — свойство события, а не сбой ClickHouse: повтор
+	// не изменит пустую строку, поэтому событие обязано уйти в DLQ сразу,
+	// не сжигая окно ретраев (classifyIngestErr).
+	env, err := kafkax.NewEnvelope(kafkax.EventOrderPaid, "", &eventsv1.OrderPaid{
+		ListingId:  "photo-1",
+		AuthorId:   10,
+		BuyerId:    20,
+		PriceCents: 1999,
+	})
+	require.NoError(t, err)
+
+	err = c.handleOrderPaid(context.Background(), env)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, kafkax.ErrPermanent)
+	assert.ErrorIs(t, err, domain.ErrEmptyOrderID)
+}
+
+func TestHandlePhotoViewed_PustoyPhotoIDPostoyannayaOshibka(t *testing.T) {
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
+
+	env, err := kafkax.NewEnvelope(kafkax.EventPhotoViewed, "", &eventsv1.PhotoViewed{})
+	require.NoError(t, err)
+
+	err = c.handlePhotoViewed(context.Background(), env)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, kafkax.ErrPermanent)
+	assert.ErrorIs(t, err, domain.ErrEmptyPhotoID)
+}
+
+func TestHandlePhotoUploaded_UserIdStanovitsyaAuthorID(t *testing.T) {
+	uploads := &fakeUploadSink{}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, uploads, &fakeThumbnailSink{})}
+
+	env, err := kafkax.NewEnvelope(kafkax.EventPhotoUploaded, "photo-1", &eventsv1.PhotoUploaded{
+		PhotoId: "photo-1",
+		UserId:  10, // в media это ключ шардирования, здесь — автор; см. domain.Upload
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, c.handlePhotoUploaded(context.Background(), env))
+	require.Len(t, uploads.added, 1)
+	assert.Equal(t, "photo-1", uploads.added[0].PhotoID)
+	assert.Equal(t, int64(10), uploads.added[0].AuthorID)
+	assert.WithinDuration(t, kafkax.OccurredAt(env), uploads.added[0].OccurredAt, time.Millisecond)
+}
+
+func TestHandlePhotoUploaded_ChuzhoyPayloadPostoyannayaOshibka(t *testing.T) {
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
+
+	env, err := kafkax.NewEnvelope(kafkax.EventPhotoViewed, "photo-1", &eventsv1.PhotoViewed{PhotoId: "photo-1"})
+	require.NoError(t, err)
+
+	err = c.handlePhotoUploaded(context.Background(), env)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, kafkax.ErrPermanent, "битый/чужой payload не станет валидным после повтора")
+}
+
+func TestHandlePhotoUploaded_PustoyPhotoIDPostoyannayaOshibka(t *testing.T) {
+	uploads := &fakeUploadSink{}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, uploads, &fakeThumbnailSink{})}
+
+	env, err := kafkax.NewEnvelope(kafkax.EventPhotoUploaded, "", &eventsv1.PhotoUploaded{})
+	require.NoError(t, err)
+
+	err = c.handlePhotoUploaded(context.Background(), env)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, kafkax.ErrPermanent)
+	assert.ErrorIs(t, err, domain.ErrEmptyPhotoID)
+	assert.Empty(t, uploads.added)
+}
+
+func TestHandleThumbnailReady_RazbiraetKonvertIZovyotIngest(t *testing.T) {
+	thumbnails := &fakeThumbnailSink{}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, thumbnails)}
+
+	// user_id и список превью в payload есть, но факту нужны только photo_id
+	// и время — см. комментарий у domain.Thumbnail.
+	env, err := kafkax.NewEnvelope(kafkax.EventPhotoThumbnailReady, "photo-1", &eventsv1.PhotoThumbnailReady{
+		PhotoId: "photo-1",
+		UserId:  10,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, c.handleThumbnailReady(context.Background(), env))
+	require.Len(t, thumbnails.added, 1)
+	assert.Equal(t, domain.Thumbnail{
+		PhotoID:    "photo-1",
+		OccurredAt: kafkax.OccurredAt(env),
+	}, thumbnails.added[0])
+}
+
+func TestHandleThumbnailReady_ChuzhoyPayloadPostoyannayaOshibka(t *testing.T) {
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, &fakeThumbnailSink{})}
+
+	env, err := kafkax.NewEnvelope(kafkax.EventOrderPaid, "order-1", &eventsv1.OrderPaid{OrderId: "order-1"})
+	require.NoError(t, err)
+
+	err = c.handleThumbnailReady(context.Background(), env)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, kafkax.ErrPermanent)
+}
+
+func TestHandleThumbnailReady_PustoyPhotoIDPostoyannayaOshibka(t *testing.T) {
+	thumbnails := &fakeThumbnailSink{}
+	c := &Consumers{ingest: app.NewIngest(&fakeViewSink{}, &fakePurchaseSink{}, &fakeUploadSink{}, thumbnails)}
+
+	env, err := kafkax.NewEnvelope(kafkax.EventPhotoThumbnailReady, "", &eventsv1.PhotoThumbnailReady{})
+	require.NoError(t, err)
+
+	err = c.handleThumbnailReady(context.Background(), env)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, kafkax.ErrPermanent)
+	assert.ErrorIs(t, err, domain.ErrEmptyPhotoID)
+	assert.Empty(t, thumbnails.added)
 }

@@ -64,6 +64,36 @@ func (s *Server) PhotoStats(ctx context.Context, req *analyticsv1.PhotoStatsRequ
 	}, nil
 }
 
+func (s *Server) FunnelStats(ctx context.Context, req *analyticsv1.FunnelStatsRequest) (*analyticsv1.FunnelStatsResponse, error) {
+	stats, err := s.stats.FunnelStats(ctx, req.GetPeriod())
+	if err != nil {
+		return nil, grpcx.ToStatus(toCoded(err), "FUNNEL_STATS_FAILED")
+	}
+
+	return &analyticsv1.FunnelStatsResponse{
+		Uploads:      stats.Uploads,
+		Thumbnails:   stats.Thumbnails,
+		ReadyPercent: stats.ReadyPercent,
+		LatencyP50Ms: stats.LatencyP50Ms,
+		LatencyP95Ms: stats.LatencyP95Ms,
+	}, nil
+}
+
+func (s *Server) AuthorStats(ctx context.Context, req *analyticsv1.AuthorStatsRequest) (*analyticsv1.AuthorStatsResponse, error) {
+	stats, err := s.stats.AuthorStats(ctx, req.GetAuthorId(), req.GetPeriod())
+	if err != nil {
+		return nil, grpcx.ToStatus(toCoded(err), "AUTHOR_STATS_FAILED")
+	}
+
+	return &analyticsv1.AuthorStatsResponse{
+		Views:               stats.Views,
+		UniqueViewersApprox: stats.UniqueViewersApprox,
+		Purchases:           stats.Purchases,
+		RevenueCents:        stats.RevenueCents,
+		Uploads:             stats.Uploads,
+	}, nil
+}
+
 // toCoded переводит доменные ошибки валидации в конкретный gRPC-код.
 //
 // Маппинг живёт здесь (адаптер), а не в domain — см. docs/STYLE.md и тот же
@@ -73,7 +103,8 @@ func toCoded(err error) error {
 	switch {
 	case errors.Is(err, domain.ErrInvalidPeriod),
 		errors.Is(err, domain.ErrInvalidLimit),
-		errors.Is(err, domain.ErrEmptyPhotoID):
+		errors.Is(err, domain.ErrEmptyPhotoID),
+		errors.Is(err, domain.ErrInvalidAuthorID):
 		return withCode(err, codes.InvalidArgument)
 	default:
 		return err

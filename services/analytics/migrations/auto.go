@@ -39,7 +39,9 @@ import (
 
 // statements — DDL в порядке, в котором его обязан увидеть ClickHouse:
 // таблица-источник, таблица-приёмник материализованного представления,
-// само представление (ему нужны обе), и независимая таблица purchases.
+// само представление (ему нужны обе), и независимые таблицы purchases,
+// uploads и thumbnails — таблицы воронки идут со своими витринами по
+// тому же правилу «источник → витрина → MV».
 var statements = []string{
 	// photo_views — сырые события. ORDER BY (photo_id, ts), а не (ts) и не
 	// (author_id, ts): подробный разбор — в README сервиса. Коротко: обе
@@ -136,10 +138,89 @@ var statements = []string{
 		buyer_id    Int64,
 		price_cents Int64,
 		ts          DateTime64(3)
-	)
+	})
 	ENGINE = MergeTree
 	PARTITION BY toYYYYMM(ts)
 	ORDER BY (photo_id, ts)`,
+
+	// uploads — из media.photo.uploaded, начало воронки «загружено →
+	// превью готово». ORDER BY по автору, потому что единственный отчёт по
+	// этой таблице (AuthorStats) фильтрует по author_id — та же логика
+	// «ORDER BY под запрос», что у photo_views: FunnelStats читает таблицу
+	// только через джойн по photo_id и дневную витрину, и ему физический
+	// порядок строк не важен, а AuthorStats без него сканировал бы всё.
+	`CREATE TABLE IF NOT EXISTS uploads
+	(
+		photo_id  UUID,
+		author_id Int64,
+		ts        DateTime64(3)
+	)
+	ENGINE = MergeTree
+	PARTITION BY toYYYYMM(ts)
+	ORDER BY (author_id, ts)
+	TTL toDateTime(ts) + INTERVAL 1 YEAR`,
+
+	// thumbnails — из media.photo.thumbnail-ready, конец воронки.
+	// ORDER BY (photo_id, ts): единственный точечный доступ к этой таблице
+	// — джойн по photo_id в latency-запросе FunnelStats, то есть ровно тот
+	// случай «первая колонка ORDER BY совпадает с условием соединения», для
+	// которого разреженный индекс и существует. TTL — как у uploads: воронка
+	// старше года не интересна ни одному отчёту (period ограничен месяцем).
+	`CREATE TABLE IF NOT EXISTS thumbnails
+	(
+		photo_id UUID,
+		ts       DateTime64(3)
+	)
+	ENGINE = MergeTree
+	PARTITION BY toYYYYMM(ts)
+	ORDER BY (photo_id, ts)
+	TTL toDateTime(ts) + INTERVAL 1 YEAR`,
+
+	// uploads_daily / thumbnails_daily — дневные витрины воронки для
+	// Grafana и FunnelStats: sum() по granules вместо скана сырых таблиц,
+	// ровно та же роль, что photo_views_daily играет для TopPhotos.
+	// SummingMergeTree и обязательный sum() в запросах — по той же причине
+	// (несведённые строки на пару (day) живут на диске до фонового мержа,
+	// см. комментарий у photo_views_daily).
+	`CREATE TABLE IF NOT EXISTS uploads_daily
+	(
+		day     Date,
+		uploads UInt64
+	)
+	ENGINE = SummingMergeTree(uploads)
+	PARTITION BY toYYYYMM(day)
+	ORDER BY (day)`,
+
+	// uploads_daily_mv — тот же механизм «MV TO <таблица>», что
+	// photo_views_daily_mv выше (и те же следствия: история, вставленная
+	// до создания представления, в витрину не попадёт).
+	`CREATE MATERIALIZED VIEW IF NOT EXISTS uploads_daily_mv
+	TO uploads_daily
+	AS
+	SELECT
+		toDate(ts) AS day,
+		count() AS uploads
+	FROM uploads
+	GROUP BY day`,
+
+	`CREATE TABLE IF NOT EXISTS thumbnails_daily
+	(
+		day        Date,
+		thumbnails UInt64
+	)
+	ENGINE = SummingMergeTree(thumbnails)
+	PARTITION BY toYYYYMM(day)
+	ORDER BY (day)`,
+
+	// thumbnails_daily_mv — парный к uploads_daily_mv.
+	`CREATE MATERIALIZED VIEW IF NOT EXISTS thumbnails_daily_mv
+	TO thumbnails_daily
+	AS
+	SELECT
+		toDate(ts) AS day,
+		count() AS thumbnails
+	FROM thumbnails
+	GROUP BY day`,
 }
 
 // Migrate применяет схему. Идемпотентна (IF NOT EXISTS везде) — безопасно

@@ -4,10 +4,13 @@
 // Несколько независимых занятий в одном процессе:
 //
 //	gRPC :9106        — AnalyticsService (proto/gosplash/analytics/v1):
-//	                    TopPhotos и PhotoStats, читает из ClickHouse.
-//	Kafka-консьюмеры  — слушают analytics.photo.viewed и order.order.paid,
-//	                    батчами пишут в photo_views и purchases
-//	                    (internal/adapters/kafka, internal/adapters/clickhouse).
+//	                    TopPhotos, PhotoStats, FunnelStats и AuthorStats,
+//	                    читает из ClickHouse.
+//	Kafka-консьюмеры  — слушают analytics.photo.viewed, order.order.paid,
+//	                    media.photo.uploaded и media.photo.thumbnail-ready,
+//	                    батчами пишут в photo_views, purchases, uploads и
+//	                    thumbnails (internal/adapters/kafka,
+//	                    internal/adapters/clickhouse).
 //	                    Почему консьюмер на Go, а не Kafka engine ClickHouse —
 //	                    docs/adr/0016-clickhouse-kafka-engine.md.
 //	HTTP :8106        — /healthz, /readyz (ClickHouse ping + Kafka ping).
@@ -118,9 +121,12 @@ func run() error {
 	repository := analyticsch.NewRepository(chClient.Conn)
 	viewWriter := analyticsch.NewViewWriter(chClient.Conn, local.ViewBatchSize, local.ViewBatchFlushInterval)
 	purchaseWriter := analyticsch.NewPurchaseWriter(chClient.Conn, local.PurchaseBatchSize, local.PurchaseBatchFlushInterval)
-	ingest := app.NewIngest(viewWriter, purchaseWriter)
+	uploadWriter := analyticsch.NewUploadWriter(chClient.Conn, local.UploadBatchSize, local.UploadBatchFlushInterval)
+	thumbnailWriter := analyticsch.NewThumbnailWriter(chClient.Conn, local.ThumbnailBatchSize, local.ThumbnailBatchFlushInterval)
+	ingest := app.NewIngest(viewWriter, purchaseWriter, uploadWriter, thumbnailWriter)
 
-	// ── Kafka: два независимых консьюмера ───────────────────────────────────
+	// ── Kafka: четыре независимых консьюмера (просмотры, покупки, загрузки,
+	// превью — по одному на топик, см. adapters/kafka) ───────────────────────
 	consumers, err := analyticskafka.New(conf.Kafka.Brokers, local.KafkaConsumerGroup, ingest)
 	if err != nil {
 		return fmt.Errorf("analytics: kafka: %w", err)
@@ -133,9 +139,12 @@ func run() error {
 		ClickHousePing: chClient.Ping,
 		JWTSecret:      conf.GRPC.JWTSecret,
 		DefaultTimeout: conf.GRPC.DefaultTimeout,
-		GRPCAddr:       local.GRPCAddr,
-		HTTPAddr:       local.HTTPAddr,
-		MetricsAddr:    local.MetricsAddr,
+		// Reflection для make grpc-reflect и grpcurl-демо (demo-funnel);
+		// в проде флаг остаётся false (см. pkg/config про поверхность атаки).
+		GRPCReflectionEnabled: conf.GRPC.ReflectionEnabled,
+		GRPCAddr:              local.GRPCAddr,
+		HTTPAddr:              local.HTTPAddr,
+		MetricsAddr:           local.MetricsAddr,
 	})
 	if err != nil {
 		return fmt.Errorf("analytics: сборка приложения: %w", err)

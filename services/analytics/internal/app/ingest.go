@@ -17,12 +17,14 @@ import (
 // анонимный просмотр" остаётся на границе, где Envelope превращается в
 // domain.PhotoView (см. комментарий у domain.PhotoView).
 type Ingest struct {
-	views     ports.ViewSink
-	purchases ports.PurchaseSink
+	views      ports.ViewSink
+	purchases  ports.PurchaseSink
+	uploads    ports.UploadSink
+	thumbnails ports.ThumbnailSink
 }
 
-func NewIngest(views ports.ViewSink, purchases ports.PurchaseSink) *Ingest {
-	return &Ingest{views: views, purchases: purchases}
+func NewIngest(views ports.ViewSink, purchases ports.PurchaseSink, uploads ports.UploadSink, thumbnails ports.ThumbnailSink) *Ingest {
+	return &Ingest{views: views, purchases: purchases, uploads: uploads, thumbnails: thumbnails}
 }
 
 // PhotoViewed принимает один факт просмотра.
@@ -54,7 +56,7 @@ func (i *Ingest) PhotoViewed(ctx context.Context, photoID string, authorID, view
 // OrderPaid принимает один факт покупки.
 func (i *Ingest) OrderPaid(ctx context.Context, orderID, photoID string, authorID, buyerID, priceCents int64, occurredAt time.Time) error {
 	if orderID == "" {
-		return fmt.Errorf("order.order.paid: пустой order_id")
+		return fmt.Errorf("order.order.paid: %w", domain.ErrEmptyOrderID)
 	}
 	if photoID == "" {
 		return fmt.Errorf("order.order.paid: %w", domain.ErrEmptyPhotoID)
@@ -70,6 +72,43 @@ func (i *Ingest) OrderPaid(ctx context.Context, orderID, photoID string, authorI
 	}
 	if err := i.purchases.Add(ctx, purchase); err != nil {
 		return fmt.Errorf("запись покупки %s: %w", orderID, err)
+	}
+	return nil
+}
+
+// PhotoUploaded принимает факт загрузки фото (media.photo.uploaded).
+//
+// authorID приходит из PhotoUploaded.user_id — см. комментарий у
+// domain.Upload, почему это одно и то же число.
+func (i *Ingest) PhotoUploaded(ctx context.Context, photoID string, authorID int64, occurredAt time.Time) error {
+	if photoID == "" {
+		return fmt.Errorf("media.photo.uploaded: %w", domain.ErrEmptyPhotoID)
+	}
+
+	upload := domain.Upload{
+		PhotoID:    photoID,
+		AuthorID:   authorID,
+		OccurredAt: occurredAt,
+	}
+	if err := i.uploads.Add(ctx, upload); err != nil {
+		return fmt.Errorf("запись загрузки %s: %w", photoID, err)
+	}
+	return nil
+}
+
+// ThumbnailReady принимает факт готовности превью
+// (media.photo.thumbnail-ready).
+func (i *Ingest) ThumbnailReady(ctx context.Context, photoID string, occurredAt time.Time) error {
+	if photoID == "" {
+		return fmt.Errorf("media.photo.thumbnail-ready: %w", domain.ErrEmptyPhotoID)
+	}
+
+	thumbnail := domain.Thumbnail{
+		PhotoID:    photoID,
+		OccurredAt: occurredAt,
+	}
+	if err := i.thumbnails.Add(ctx, thumbnail); err != nil {
+		return fmt.Errorf("запись готовности превью %s: %w", photoID, err)
 	}
 	return nil
 }

@@ -19,8 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AnalyticsService_TopPhotos_FullMethodName  = "/gosplash.analytics.v1.AnalyticsService/TopPhotos"
-	AnalyticsService_PhotoStats_FullMethodName = "/gosplash.analytics.v1.AnalyticsService/PhotoStats"
+	AnalyticsService_TopPhotos_FullMethodName   = "/gosplash.analytics.v1.AnalyticsService/TopPhotos"
+	AnalyticsService_PhotoStats_FullMethodName  = "/gosplash.analytics.v1.AnalyticsService/PhotoStats"
+	AnalyticsService_FunnelStats_FullMethodName = "/gosplash.analytics.v1.AnalyticsService/FunnelStats"
+	AnalyticsService_AuthorStats_FullMethodName = "/gosplash.analytics.v1.AnalyticsService/AuthorStats"
 )
 
 // AnalyticsServiceClient is the client API for AnalyticsService service.
@@ -38,6 +40,8 @@ const (
 type AnalyticsServiceClient interface {
 	TopPhotos(ctx context.Context, in *TopPhotosRequest, opts ...grpc.CallOption) (*TopPhotosResponse, error)
 	PhotoStats(ctx context.Context, in *PhotoStatsRequest, opts ...grpc.CallOption) (*PhotoStatsResponse, error)
+	FunnelStats(ctx context.Context, in *FunnelStatsRequest, opts ...grpc.CallOption) (*FunnelStatsResponse, error)
+	AuthorStats(ctx context.Context, in *AuthorStatsRequest, opts ...grpc.CallOption) (*AuthorStatsResponse, error)
 }
 
 type analyticsServiceClient struct {
@@ -68,6 +72,26 @@ func (c *analyticsServiceClient) PhotoStats(ctx context.Context, in *PhotoStatsR
 	return out, nil
 }
 
+func (c *analyticsServiceClient) FunnelStats(ctx context.Context, in *FunnelStatsRequest, opts ...grpc.CallOption) (*FunnelStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FunnelStatsResponse)
+	err := c.cc.Invoke(ctx, AnalyticsService_FunnelStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *analyticsServiceClient) AuthorStats(ctx context.Context, in *AuthorStatsRequest, opts ...grpc.CallOption) (*AuthorStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AuthorStatsResponse)
+	err := c.cc.Invoke(ctx, AnalyticsService_AuthorStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AnalyticsServiceServer is the server API for AnalyticsService service.
 // All implementations must embed UnimplementedAnalyticsServiceServer
 // for forward compatibility.
@@ -83,6 +107,8 @@ func (c *analyticsServiceClient) PhotoStats(ctx context.Context, in *PhotoStatsR
 type AnalyticsServiceServer interface {
 	TopPhotos(context.Context, *TopPhotosRequest) (*TopPhotosResponse, error)
 	PhotoStats(context.Context, *PhotoStatsRequest) (*PhotoStatsResponse, error)
+	FunnelStats(context.Context, *FunnelStatsRequest) (*FunnelStatsResponse, error)
+	AuthorStats(context.Context, *AuthorStatsRequest) (*AuthorStatsResponse, error)
 	mustEmbedUnimplementedAnalyticsServiceServer()
 }
 
@@ -98,6 +124,12 @@ func (UnimplementedAnalyticsServiceServer) TopPhotos(context.Context, *TopPhotos
 }
 func (UnimplementedAnalyticsServiceServer) PhotoStats(context.Context, *PhotoStatsRequest) (*PhotoStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PhotoStats not implemented")
+}
+func (UnimplementedAnalyticsServiceServer) FunnelStats(context.Context, *FunnelStatsRequest) (*FunnelStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method FunnelStats not implemented")
+}
+func (UnimplementedAnalyticsServiceServer) AuthorStats(context.Context, *AuthorStatsRequest) (*AuthorStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AuthorStats not implemented")
 }
 func (UnimplementedAnalyticsServiceServer) mustEmbedUnimplementedAnalyticsServiceServer() {}
 func (UnimplementedAnalyticsServiceServer) testEmbeddedByValue()                          {}
@@ -156,6 +188,42 @@ func _AnalyticsService_PhotoStats_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AnalyticsService_FunnelStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FunnelStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnalyticsServiceServer).FunnelStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnalyticsService_FunnelStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnalyticsServiceServer).FunnelStats(ctx, req.(*FunnelStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AnalyticsService_AuthorStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AuthorStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AnalyticsServiceServer).AuthorStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AnalyticsService_AuthorStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AnalyticsServiceServer).AuthorStats(ctx, req.(*AuthorStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AnalyticsService_ServiceDesc is the grpc.ServiceDesc for AnalyticsService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -170,6 +238,14 @@ var AnalyticsService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PhotoStats",
 			Handler:    _AnalyticsService_PhotoStats_Handler,
+		},
+		{
+			MethodName: "FunnelStats",
+			Handler:    _AnalyticsService_FunnelStats_Handler,
+		},
+		{
+			MethodName: "AuthorStats",
+			Handler:    _AnalyticsService_AuthorStats_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -1,5 +1,6 @@
-// analytics-seed — засевает photo_views синтетическими просмотрами для
-// демо (mk/analytics.mk: analytics-seed, demo-clickhouse).
+// analytics-seed — засевает photo_views синтетическими просмотрами, а
+// вместе с ними — таблицы воронки uploads/thumbnails (см. seed) для демо
+// (mk/analytics.mk: analytics-seed, demo-clickhouse, demo-funnel).
 //
 // ПОЧЕМУ ОТДЕЛЬНАЯ УТИЛИТА, А НЕ "ПРОГНАТЬ N СОБЫТИЙ ЧЕРЕЗ KAFKA": цель —
 // быстро наполнить ClickHouse миллионами строк для демонстрации разницы
@@ -32,7 +33,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"time"
 
@@ -112,7 +113,7 @@ type photoPool struct {
 
 func newPhotoPool(n int) photoPool {
 	p := photoPool{photoIDs: make([]string, n), authorIDs: make([]int64, n)}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// Валидный UUID (8-4-4-4-12 hex), а не случайная строка с префиксом
 		// "seed-": колонка photo_id типизирована как UUID (см.
 		// migrations/auto.go), и clickhouse-go парсит параметр через
@@ -128,14 +129,28 @@ func newPhotoPool(n int) photoPool {
 
 // seed вставляет total строк пачками по batchSize через clickhouse-go —
 // см. комментарий пакета про то, почему не по одной строке.
+//
+// Вместе с просмотрами засевается воронка «загружено → превью готово»:
+// на каждый ~10-й просмотр — загрузка того же фото тем же автором, и на
+// ~95% этих загрузок — готовность превью со случайным лагом 200мс..30с.
+// Оставшиеся ~5% загрузок «застревают в генерации» НАМЕРЕННО: дроп-офф
+// воронки — это не артефакт сида, а ровно то состояние конвейера, которое
+// FunnelStats.ready_percent < 100 и должен показывать (фото без превью
+// не доезжает до каталога — так же, как в живой системе при падении
+// thumbnail-worker).
 func seed(ctx context.Context, client *clickhouse.Client, total, batchSize, photoCount, windowDays int) error {
 	pool := newPhotoPool(photoCount)
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// rand/v2 не требует ручного сида: пакетовые функции сеются сами
+	// (в отличие от math/rand, где фиксированный сид по умолчанию делал бы
+	// каждый запуск детерминированным), а локальный источник ради одной
+	// горутины здесь больше не нужен.
 	now := time.Now()
 	window := time.Duration(windowDays) * 24 * time.Hour
 
 	started := time.Now()
 	inserted := 0
+	uploadsInserted := 0
+	thumbnailsInserted := 0
 	for inserted < total {
 		n := batchSize
 		if remaining := total - inserted; remaining < n {
@@ -146,36 +161,82 @@ func seed(ctx context.Context, client *clickhouse.Client, total, batchSize, phot
 		if err != nil {
 			return fmt.Errorf("prepare batch: %w", err)
 		}
+		uploadsBatch, err := client.Conn.PrepareBatch(ctx, "INSERT INTO uploads (photo_id, author_id, ts)")
+		if err != nil {
+			return fmt.Errorf("prepare batch uploads: %w", err)
+		}
+		thumbnailsBatch, err := client.Conn.PrepareBatch(ctx, "INSERT INTO thumbnails (photo_id, ts)")
+		if err != nil {
+			return fmt.Errorf("prepare batch thumbnails: %w", err)
+		}
 
-		for i := 0; i < n; i++ {
-			idx := rng.Intn(photoCount)
-			ts := now.Add(-time.Duration(rng.Int63n(int64(window))))
-			country := countries[rng.Intn(len(countries))]
+		batchUploads, batchThumbnails := 0, 0
+		for range n {
+			idx := rand.IntN(photoCount)
+			ts := now.Add(-rand.N(window))
+			country := countries[rand.IntN(len(countries))]
 
 			// ~30% просмотров анонимные — viewer_id остаётся nil (NULL),
 			// см. комментарий domain.PhotoView про то, почему это НЕ ноль.
 			var viewerID *int64
-			if rng.Intn(10) >= 3 {
-				v := int64(rng.Intn(2_000_000))
+			if rand.IntN(10) >= 3 {
+				v := int64(rand.IntN(2_000_000))
 				viewerID = &v
 			}
 
 			if err := batch.Append(pool.photoIDs[idx], pool.authorIDs[idx], viewerID, ts, country); err != nil {
 				return fmt.Errorf("append: %w", err)
 			}
+
+			// Каждый ~10-й просмотр дополняется загрузкой этого фото —
+			// пропорция условная: демо важен порядок величин и ненулевой
+			// хвост лагов, а не точная копия продакшен-конверсии.
+			if rand.IntN(10) == 0 {
+				if err := uploadsBatch.Append(pool.photoIDs[idx], pool.authorIDs[idx], ts); err != nil {
+					return fmt.Errorf("append uploads: %w", err)
+				}
+				batchUploads++
+
+				// ~95% загрузок получают превью; лаг 200мс..30s — типичный
+				// коридор ресайза из thumbnail-worker плюс очередь.
+				if rand.IntN(100) < 95 {
+					latency := 200*time.Millisecond + time.Duration(rand.Int64N(int64(30*time.Second-200*time.Millisecond)))
+					if err := thumbnailsBatch.Append(pool.photoIDs[idx], ts.Add(latency)); err != nil {
+						return fmt.Errorf("append thumbnails: %w", err)
+					}
+					batchThumbnails++
+				}
+			}
 		}
 
 		if err := batch.Send(); err != nil {
 			return fmt.Errorf("send batch (%d строк): %w", n, err)
 		}
+		// Пустой батч не отправляем: последних строк окна может не хватить
+		// ни на одну загрузку, и Send без строк — это лишний round-trip
+		// (а для каких-то версий драйвера и ошибка).
+		if batchUploads > 0 {
+			if err := uploadsBatch.Send(); err != nil {
+				return fmt.Errorf("send uploads batch (%d строк): %w", batchUploads, err)
+			}
+		}
+		if batchThumbnails > 0 {
+			if err := thumbnailsBatch.Send(); err != nil {
+				return fmt.Errorf("send thumbnails batch (%d строк): %w", batchThumbnails, err)
+			}
+		}
 
 		inserted += n
+		uploadsInserted += batchUploads
+		thumbnailsInserted += batchThumbnails
 		slog.Info("analytics-seed: вставлено",
 			"inserted", inserted, "total", total,
+			"uploads", uploadsInserted, "thumbnails", thumbnailsInserted,
 			"elapsed", time.Since(started).Round(time.Millisecond))
 	}
 
 	slog.Info("analytics-seed: готово",
-		"rows", inserted, "elapsed", time.Since(started).Round(time.Millisecond))
+		"rows", inserted, "uploads", uploadsInserted, "thumbnails", thumbnailsInserted,
+		"elapsed", time.Since(started).Round(time.Millisecond))
 	return nil
 }

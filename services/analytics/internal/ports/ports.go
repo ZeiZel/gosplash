@@ -20,6 +20,10 @@ type StatsReader interface {
 	TopPhotos(ctx context.Context, period domain.Period, limit int32) ([]domain.PhotoRank, error)
 	// PhotoStats — сводка по одному фото за период.
 	PhotoStats(ctx context.Context, photoID string, period domain.Period) (domain.PhotoStats, error)
+	// FunnelStats — воронка «загружено → превью готово» за период.
+	FunnelStats(ctx context.Context, period domain.Period) (domain.FunnelStats, error)
+	// AuthorStats — сводка по одному автору за период.
+	AuthorStats(ctx context.Context, authorID int64, period domain.Period) (domain.AuthorStats, error)
 }
 
 // ViewSink — приёмник фактов "просмотр" со стороны Kafka-консьюмера
@@ -40,4 +44,19 @@ type ViewSink interface {
 // сигнатуре, а не только в конфиге.
 type PurchaseSink interface {
 	Add(ctx context.Context, purchase domain.Purchase) error
+}
+
+// UploadSink и ThumbnailSink — приёмники фактов воронки «загружено →
+// превью готово». Они могли бы быть одним FunnelSink с двумя методами, но
+// остаются двумя по образцу PurchaseSink: события воронки редкие, как
+// покупки (загрузка — это осознанное действие человека, не просмотр
+// карточки), поэтому их батчингу нужны СВОИ малые пределы — а раз пределы
+// свои, то и порт свой, иначе разница видна только в конфиге и легко
+// «выравнивается» одним общим Writer'ом по ошибке.
+type UploadSink interface {
+	Add(ctx context.Context, upload domain.Upload) error
+}
+
+type ThumbnailSink interface {
+	Add(ctx context.Context, thumbnail domain.Thumbnail) error
 }

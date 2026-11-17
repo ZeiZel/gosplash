@@ -229,8 +229,7 @@ type Order struct {
 	PriceCents int64                  `protobuf:"varint,4,opt,name=price_cents,json=priceCents,proto3" json:"price_cents,omitempty"`
 	Currency   string                 `protobuf:"bytes,5,opt,name=currency,proto3" json:"currency,omitempty"`
 	// pending → funds_reserved → license_granted → completed
-	//
-	//	↘ compensating → failed
+	//         ↘ compensating → failed
 	//
 	// Состояние в прошедшем времени описывает, что УЖЕ удалось, а не что
 	// происходит: во время ретрая шага заказ остаётся в предыдущем состоянии,

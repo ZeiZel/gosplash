@@ -63,3 +63,36 @@ func (s *StatsService) PhotoStats(ctx context.Context, photoID, periodRaw string
 	}
 	return stats, nil
 }
+
+// FunnelStats валидирует period и делегирует чтение. Параметров-идентификаторов
+// у метода нет: воронка одна на всю систему — это отчёт о конвейере, а не
+// о сущности.
+func (s *StatsService) FunnelStats(ctx context.Context, periodRaw string) (domain.FunnelStats, error) {
+	period, err := domain.ParsePeriod(periodRaw)
+	if err != nil {
+		return domain.FunnelStats{}, err
+	}
+
+	stats, err := s.reader.FunnelStats(ctx, period)
+	if err != nil {
+		return domain.FunnelStats{}, fmt.Errorf("воронка загрузки за %s: %w", period, err)
+	}
+	return stats, nil
+}
+
+// AuthorStats валидирует authorID и period и делегирует чтение.
+func (s *StatsService) AuthorStats(ctx context.Context, authorID int64, periodRaw string) (domain.AuthorStats, error) {
+	if authorID <= 0 {
+		return domain.AuthorStats{}, fmt.Errorf("%w: получено %d", domain.ErrInvalidAuthorID, authorID)
+	}
+	period, err := domain.ParsePeriod(periodRaw)
+	if err != nil {
+		return domain.AuthorStats{}, err
+	}
+
+	stats, err := s.reader.AuthorStats(ctx, authorID, period)
+	if err != nil {
+		return domain.AuthorStats{}, fmt.Errorf("сводка по автору %d за %s: %w", authorID, period, err)
+	}
+	return stats, nil
+}

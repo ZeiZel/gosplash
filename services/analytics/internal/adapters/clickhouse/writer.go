@@ -84,3 +84,74 @@ func insertPurchases(ctx context.Context, conn chdriver.Conn, rows []domain.Purc
 	}
 	return nil
 }
+
+// UploadWriter — реализация ports.UploadSink: batch-вставка в таблицу
+// uploads. Устроен в точности как PurchaseWriter, а не как ViewWriter:
+// события воронки редкие (одна загрузка — одно событие), и их батчингу
+// нужны малые пределы, как у покупок (см. pkg/config про параметры).
+type UploadWriter struct {
+	batch *Writer[domain.Upload]
+}
+
+func NewUploadWriter(conn chdriver.Conn, batchSize int, flushInterval time.Duration) *UploadWriter {
+	w := &UploadWriter{}
+	w.batch = NewWriter(batchSize, flushInterval, func(ctx context.Context, rows []domain.Upload) error {
+		return insertUploads(ctx, conn, rows)
+	})
+	return w
+}
+
+func (w *UploadWriter) Add(ctx context.Context, upload domain.Upload) error {
+	return w.batch.Add(ctx, upload)
+}
+
+func insertUploads(ctx context.Context, conn chdriver.Conn, rows []domain.Upload) error {
+	batch, err := conn.PrepareBatch(ctx, "INSERT INTO uploads (photo_id, author_id, ts)")
+	if err != nil {
+		return fmt.Errorf("clickhouse: prepare batch uploads: %w", err)
+	}
+	for _, u := range rows {
+		if err := batch.Append(u.PhotoID, u.AuthorID, u.OccurredAt); err != nil {
+			return fmt.Errorf("clickhouse: append uploads: %w", err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("clickhouse: send uploads (%d строк): %w", len(rows), err)
+	}
+	return nil
+}
+
+// ThumbnailWriter — реализация ports.ThumbnailSink: batch-вставка в
+// thumbnails. Самый тощий факт сервиса (два поля) — и писатель под него
+// такой же, как UploadWriter: один Writer[T] на таблицу.
+type ThumbnailWriter struct {
+	batch *Writer[domain.Thumbnail]
+}
+
+func NewThumbnailWriter(conn chdriver.Conn, batchSize int, flushInterval time.Duration) *ThumbnailWriter {
+	w := &ThumbnailWriter{}
+	w.batch = NewWriter(batchSize, flushInterval, func(ctx context.Context, rows []domain.Thumbnail) error {
+		return insertThumbnails(ctx, conn, rows)
+	})
+	return w
+}
+
+func (w *ThumbnailWriter) Add(ctx context.Context, thumbnail domain.Thumbnail) error {
+	return w.batch.Add(ctx, thumbnail)
+}
+
+func insertThumbnails(ctx context.Context, conn chdriver.Conn, rows []domain.Thumbnail) error {
+	batch, err := conn.PrepareBatch(ctx, "INSERT INTO thumbnails (photo_id, ts)")
+	if err != nil {
+		return fmt.Errorf("clickhouse: prepare batch thumbnails: %w", err)
+	}
+	for _, th := range rows {
+		if err := batch.Append(th.PhotoID, th.OccurredAt); err != nil {
+			return fmt.Errorf("clickhouse: append thumbnails: %w", err)
+		}
+	}
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("clickhouse: send thumbnails (%d строк): %w", len(rows), err)
+	}
+	return nil
+}

@@ -22,6 +22,12 @@ var (
 	ErrInvalidPeriod = errors.New("неизвестный период: допустимы day, week, month")
 	ErrInvalidLimit  = errors.New("limit должен быть в диапазоне 1..1000")
 	ErrEmptyPhotoID  = errors.New("photo_id обязателен")
+	ErrEmptyOrderID  = errors.New("order_id обязателен")
+	// ErrInvalidAuthorID — author_id <= 0. Ноль и отрицательные — это
+	// «поля нет» (proto3 не отличает явный ноль от незаполненного), а не
+	// «автор с таким номером»: сводка по несуществующему автору — пустой
+	// ответ, а не ошибка, поэтому валидируется именно диапазон.
+	ErrInvalidAuthorID = errors.New("author_id должен быть положительным")
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,8 +130,32 @@ type PhotoStats struct {
 	RevenueCents        int64
 }
 
+// FunnelStats — воронка «загружено → превью готово» за период (proto:
+// FunnelStatsResponse). Считается из тех же соображений, что и PhotoStats:
+// сводные числа, а не сырые строки.
+type FunnelStats struct {
+	Uploads      int64
+	Thumbnails   int64
+	ReadyPercent float64
+	LatencyP50Ms int64
+	LatencyP95Ms int64
+}
+
+// AuthorStats — сводка по одному автору за период (proto: AuthorStatsResponse).
+// Тот же состав чисел, что у PhotoStats, плюс Uploads: автор — единственная
+// сущность, у которой «сколько загрузил» имеет смысл (у фото ровно одна
+// загрузка по определению).
+type AuthorStats struct {
+	Views               int64
+	UniqueViewersApprox int64
+	Purchases           int64
+	RevenueCents        int64
+	Uploads             int64
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Факты, приходящие из Kafka (analytics.photo.viewed, order.order.paid).
+// Факты, приходящие из Kafka (analytics.photo.viewed, order.order.paid,
+// media.photo.uploaded, media.photo.thumbnail-ready).
 // Отдельные от protobuf-payload типы — как раз тот случай, когда домен и
 // провод расходятся: PhotoViewed.viewer_id=0 в protobuf означает анонима
 // (см. proto/gosplash/events/v1/events.proto), а в ClickHouse анонимный
@@ -152,5 +182,28 @@ type Purchase struct {
 	AuthorID   int64
 	BuyerID    int64
 	PriceCents int64
+	OccurredAt time.Time
+}
+
+// Upload — «автор загрузил фото» (media.photo.uploaded). Отдельный факт, а не
+// атрибут фото: воронке FunnelStats важен МОМЕНТ загрузки (лаг до
+// thumbnail-ready считается между двумя событиями), поэтому это строка в
+// таблице фактов uploads, а не колонка где-то ещё.
+type Upload struct {
+	PhotoID string
+	// AuthorID — это PhotoUploaded.user_id: в media user_id — ключ
+	// шардирования и одновременно владелец фото, то есть автор (см.
+	// комментарий к полю в events.proto). Переименование на границе
+	// Kafka→домен, а не в самом домене: аналитика говорит языком авторов.
+	AuthorID   int64
+	OccurredAt time.Time
+}
+
+// Thumbnail — «превью фото готовы» (media.photo.thumbnail-ready). Событие
+// несёт и user_id, и список ключей превью (см. events.proto), но факт здесь
+// ОДНОЗНАЧНО тоньше: воронке нужен только момент, когда фото стало готово
+// к показу, — остальное потребители события (catalog) используют по месту.
+type Thumbnail struct {
+	PhotoID    string
 	OccurredAt time.Time
 }

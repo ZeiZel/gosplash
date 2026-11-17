@@ -1,0 +1,33 @@
+# ClickHouse-источник для аналитического дашборда (dashboards/analytics.json).
+# Отдельный файл, а не четвёртая запись в datasources.yaml, потому что у
+# ClickHouse-плагина своя jsonData-схема (defaultDatabase/protocol, а не
+# httpMethod/prometheus-поля) — смешивать их в одном файле значило бы
+# читать два несвязанных формата подряд.
+#
+# URL — ВНУТРИСЕТЕВОЙ адрес (clickhouse:8123), а не localhost:58123:
+# grafana и clickhouse сидят в одной сети compose-проекта (все include
+# корневого docker-compose.yml попадают в gosplash_default), а 58123 — это
+# проброс порта НА ХОСТ, из контейнера он не виден. HTTP-порт (8123), а не
+# native 9000: плагин Grafana ходит по HTTP API.
+#
+# Креды открытым текстом — те же dev-значения gosplash/gosplash, что уже
+# лежат во всех compose-файлах стенда; secrets завели бы здесь ложное
+# ощущение защиты.
+
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    uid: clickhouse
+    access: proxy
+    url: http://clickhouse:8123
+    isDefault: false
+    jsonData:
+      defaultDatabase: gosplash
+      protocol: http
+      port: 8123
+      username: gosplash
+      tlsSkipVerify: false
+    secureJsonData:
+      password: gosplash

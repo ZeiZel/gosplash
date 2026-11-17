@@ -13,44 +13,50 @@ import (
 )
 
 func TestWriter_FlushPoRazmeru(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	var gotRows [][]int
 	var mu sync.Mutex
 
 	w := NewWriter(3, time.Hour, func(_ context.Context, rows []int) error {
-		atomic.AddInt32(&calls, 1)
+		calls.Add(1)
 		mu.Lock()
 		gotRows = append(gotRows, append([]int(nil), rows...))
 		mu.Unlock()
 		return nil
 	})
 
+	// require внутри горутины запрещён (t.FailNow не из тестовой горутины) —
+	// ошибки собираем в слайс по индексу и проверяем после wg.Wait().
 	var wg sync.WaitGroup
-	for i := 0; i < 3; i++ {
+	errs := make([]error, 3)
+	for i := range 3 {
 		wg.Add(1)
-		go func(v int) {
+		go func(idx int) {
 			defer wg.Done()
-			require.NoError(t, w.Add(context.Background(), v))
+			errs[idx] = w.Add(context.Background(), idx)
 		}(i)
 	}
 	wg.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
 
-	assert.Equal(t, int32(1), atomic.LoadInt32(&calls), "3 строки при maxBatch=3 обязаны уйти ОДНОЙ пачкой")
+	assert.Equal(t, int32(1), calls.Load(), "3 строки при maxBatch=3 обязаны уйти ОДНОЙ пачкой")
 	require.Len(t, gotRows, 1)
 	assert.ElementsMatch(t, []int{0, 1, 2}, gotRows[0])
 }
 
 func TestWriter_FlushPoTaymeru(t *testing.T) {
-	var calls int32
+	var calls atomic.Int32
 	w := NewWriter(1000, 20*time.Millisecond, func(_ context.Context, rows []int) error {
-		atomic.AddInt32(&calls, 1)
+		calls.Add(1)
 		return nil
 	})
 
 	err := w.Add(context.Background(), 1)
 
 	require.NoError(t, err)
-	assert.Equal(t, int32(1), atomic.LoadInt32(&calls),
+	assert.Equal(t, int32(1), calls.Load(),
 		"одна строка при maxBatch=1000 обязана дождаться флаша по таймеру, а не пачки")
 }
 
@@ -62,7 +68,7 @@ func TestWriter_OshibkaVstavkiVozvraschaetsyaVsemOzhidayuschim(t *testing.T) {
 
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
@@ -80,16 +86,16 @@ func TestWriter_DvoynoyFlushBezopasen(t *testing.T) {
 	// Таймер и достижение maxBatch могут вызвать flush() почти одновременно.
 	// Второй вызов обязан застать pending уже пустым и не запустить insert
 	// с нулём строк.
-	var calls int32
+	var calls atomic.Int32
 	w := NewWriter(1, 5*time.Millisecond, func(_ context.Context, rows []int) error {
-		atomic.AddInt32(&calls, 1)
+		calls.Add(1)
 		return nil
 	})
 
 	require.NoError(t, w.Add(context.Background(), 1))
 	time.Sleep(30 * time.Millisecond) // даём таймеру первой (уже отправленной) пачки шанс сработать вхолостую
 
-	assert.Equal(t, int32(1), atomic.LoadInt32(&calls), "insert не должен вызываться на пустой пачке")
+	assert.Equal(t, int32(1), calls.Load(), "insert не должен вызываться на пустой пачке")
 }
 
 func TestWriter_OtmenaKontekstaNeBlokiruetOstalnyeGorutiny(t *testing.T) {

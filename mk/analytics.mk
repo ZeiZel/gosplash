@@ -34,8 +34,8 @@ ch-tables: ## список таблиц analytics и их размер на ди
 ANALYTICS_SEED_N ?= 5000000
 
 .PHONY: analytics-seed
-analytics-seed: .env ## засеять N просмотров в photo_views батчами через clickhouse-go (make analytics-seed N=200000)
-	@echo "Засеваю $(or $(N),$(ANALYTICS_SEED_N)) просмотров батчами (см. cmd/seed: почему не по одной строке)…"
+analytics-seed: .env ## засеять N просмотров + воронку (uploads/thumbnails) батчами через clickhouse-go (make analytics-seed N=200000)
+	@echo "Засеваю $(or $(N),$(ANALYTICS_SEED_N)) просмотров и таблицы воронки батчами (см. cmd/seed: почему не по одной строке)…"
 	go run ./services/analytics/cmd/seed -n=$(or $(N),$(ANALYTICS_SEED_N))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,3 +108,37 @@ demo-clickhouse: ## топ-100 фото за неделю: ClickHouse vs Postgre
 	echo "только колонки (photo_id, ts, views), нужные ЭТОМУ запросу; строчное"; \
 	echo "читает строку целиком (photo_id, author_id, viewer_id, ts, country)"; \
 	echo "на каждую подходящую по индексу строку. Подробный разбор — README сервиса."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# demo-funnel — воронка «загружено → превью готово» (FunnelStats): оба
+# счётчика, готовность в процентах и лаг генерации превью, а затем готовая
+# grpcurl-строка для живого RPC. Как и demo-clickhouse, цель иллюстративная:
+# показать, ЧТО считает отчёт, на тех же данных, что лежат в ClickHouse
+# (make analytics-seed сеет их вместе с воронкой).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Порт analytics-gRPC — тот же, что ANALYTICS_GRPC_ADDR в .env.example.
+ANALYTICS_GRPC_PORT := $(or $(P),9106)
+
+.PHONY: demo-funnel
+demo-funnel: ## воронка «загружено → превью готово»: счётчики, ready %, p50/p95 лага + grpcurl (нужен analytics-seed)
+	@rows=$$($(CH_CURL) --data "SELECT count() FROM uploads" 2>/dev/null); \
+	if [ -z "$$rows" ] || [ "$$rows" = "0" ]; then \
+		echo "uploads пуста — воронку нечем показывать."; \
+		echo "Либо прогоните события через живой стек (make demo-file + make run-all),"; \
+		echo "либо засеейте демо-данные: make analytics-seed"; \
+		exit 1; \
+	fi; \
+	echo "Строк в uploads: $$rows"; \
+	echo; \
+	echo "1) Счётчики воронки и готовность (дневные витрины — тот же источник,"; \
+	echo "что у FunnelStats; ~5% загрузок в демо-данных застревают без превью):"; \
+	$(CH_CURL) --data "WITH (SELECT sum(uploads) FROM uploads_daily) AS up, (SELECT sum(thumbnails) FROM thumbnails_daily) AS th SELECT up AS uploads, th AS thumbnails, if(up = 0, 0, round(th * 100.0 / up, 1)) AS ready_percent FROM (SELECT 1) FORMAT PrettyCompact"; \
+	echo; \
+	echo "2) Лаг генерации превью, p50/p95 (INNER JOIN uploads×thumbnails по photo_id:"; \
+	echo "у фото ровно один upload и один thumbnail-ready — см. repository.go):"; \
+	$(CH_CURL) --data "SELECT ifNaN(quantileExact(0.5)(latency_ms), 0) AS p50_ms, ifNaN(quantileExact(0.95)(latency_ms), 0) AS p95_ms FROM (SELECT dateDiff('millisecond', u.ts, t.ts) AS latency_ms FROM uploads AS u INNER JOIN thumbnails AS t ON u.photo_id = t.photo_id WHERE t.ts >= u.ts) FORMAT PrettyCompact"; \
+	echo; \
+	echo "3) То же самое живым RPC (нужен запущенный analytics + reflection:"; \
+	echo "GRPC_REFLECTION_ENABLED=true в .env, make run-analytics):"; \
+	echo "grpcurl -plaintext -d '{\"period\":\"week\"}' localhost:$(ANALYTICS_GRPC_PORT) gosplash.analytics.v1.AnalyticsService/FunnelStats"

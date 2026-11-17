@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 
 	analyticsv1 "gosplash/gen/go/gosplash/analytics/v1"
 	"gosplash/pkg/grpcx"
@@ -43,13 +44,17 @@ const (
 )
 
 // Consumers — узкий срез *kafka.Consumers (адаптер analytics к Kafka):
-// RunViews/RunPurchases/PingViews/PingPurchases/Close. Интерфейс — чтобы
+// Run*/Ping* на каждый из четырёх топиков и Close. Интерфейс — чтобы
 // тест App мог подставить fake-консьюмеры без живой Kafka.
 type Consumers interface {
 	RunViews(ctx context.Context) error
 	RunPurchases(ctx context.Context) error
+	RunUploads(ctx context.Context) error
+	RunThumbnails(ctx context.Context) error
 	PingViews(ctx context.Context) error
 	PingPurchases(ctx context.Context) error
+	PingUploads(ctx context.Context) error
+	PingThumbnails(ctx context.Context) error
 	Close()
 }
 
@@ -70,14 +75,19 @@ type Deps struct {
 	JWTSecret      string
 	DefaultTimeout time.Duration
 
+	// GRPCReflectionEnabled — та же пара строк, что в bootstrap media:
+	// grpcurl-демо (make demo-funnel, grpc-reflect) без reflection требует
+	// .proto под руками, локально это никому не нужно.
+	GRPCReflectionEnabled bool
+
 	GRPCAddr    string
 	HTTPAddr    string
 	MetricsAddr string
 }
 
-// App — собранный процесс analytics: gRPC-сервер отчётов и два независимых
-// Kafka-консьюмера (просмотры, покупки). Ничего не слушает и не ловит
-// сигналы — этим занимается Run.
+// App — собранный процесс analytics: gRPC-сервер отчётов и четыре
+// независимых Kafka-консьюмера (просмотры, покупки, загрузки, превью).
+// Ничего не слушает и не ловит сигналы — этим занимается Run.
 type App struct {
 	deps Deps
 
@@ -106,17 +116,25 @@ func NewApp(deps Deps) (*App, error) {
 	grpcServer := grpcx.NewServer(grpcx.ServerParams{
 		ServiceName: serviceName,
 		JWTSecret:   []byte(deps.JWTSecret),
-		// Оба метода читают только СВОДКИ — публичная витрина отчётов,
+		// Все методы читают только СВОДКИ — публичная витрина отчётов,
 		// а не персональные данные пользователя, поэтому она, как и чтение
 		// каталога в catalog-service, доступна без токена.
 		PublicMethods: []string{
 			analyticsv1.AnalyticsService_TopPhotos_FullMethodName,
 			analyticsv1.AnalyticsService_PhotoStats_FullMethodName,
+			analyticsv1.AnalyticsService_FunnelStats_FullMethodName,
+			analyticsv1.AnalyticsService_AuthorStats_FullMethodName,
 		},
 		DefaultTimeout: deps.DefaultTimeout,
 	})
 	analyticsv1.RegisterAnalyticsServiceServer(grpcServer, analyticsServer)
 	grpcHealth.Register(grpcServer)
+	// Reflection — только по явному флагу: тот же комментарий, что у media
+	// (services/media/internal/bootstrap/app.go), причина та же — она
+	// отдаёт контракт целиком без аутентификации.
+	if deps.GRPCReflectionEnabled {
+		reflection.Register(grpcServer)
+	}
 
 	health := httpx.NewHealth()
 	if deps.ClickHousePing != nil {
@@ -124,6 +142,8 @@ func NewApp(deps Deps) (*App, error) {
 	}
 	health.Register("kafka_views", deps.Consumers.PingViews)
 	health.Register("kafka_purchases", deps.Consumers.PingPurchases)
+	health.Register("kafka_uploads", deps.Consumers.PingUploads)
+	health.Register("kafka_thumbnails", deps.Consumers.PingThumbnails)
 
 	// Публичного HTTP API у сервиса нет (наружу — только gRPC), поэтому на
 	// публичном порту — только health-хендлеры; /metrics и /debug/pprof —
@@ -145,12 +165,12 @@ func NewApp(deps Deps) (*App, error) {
 	}, nil
 }
 
-// Run поднимает серверы и оба консьюмера, блокируется до отмены ctx или до
+// Run поднимает серверы и все консьюмеры, блокируется до отмены ctx или до
 // первого фатального сбоя gRPC-сервера, затем проводит graceful shutdown.
 //
 // Порядок остановки выверен на живом кластере и переносится без изменений
 // из прежнего main.go: снять readiness → пауза → остановить серверы →
-// дождаться ОБОИХ консьюмеров.
+// дождаться ВСЕХ консьюмеров.
 func (a *App) Run(ctx context.Context) error {
 	a.metricsServer = httpx.ServeMetricsAndPprof(a.deps.MetricsAddr)
 	go httpx.Serve(a.httpServer, "public")
@@ -165,6 +185,12 @@ func (a *App) Run(ctx context.Context) error {
 
 	purchasesDone := make(chan error, 1)
 	go func() { purchasesDone <- a.deps.Consumers.RunPurchases(ctx) }()
+
+	uploadsDone := make(chan error, 1)
+	go func() { uploadsDone <- a.deps.Consumers.RunUploads(ctx) }()
+
+	thumbnailsDone := make(chan error, 1)
+	go func() { thumbnailsDone <- a.deps.Consumers.RunThumbnails(ctx) }()
 
 	var runErr error
 	select {
@@ -183,12 +209,12 @@ func (a *App) Run(ctx context.Context) error {
 	httpx.Shutdown(ctx, httpShutdownTimeout, a.httpServer, a.metricsServer)
 	grpcx.Shutdown(a.grpcServer, grpcShutdownTimeout)
 
-	// Дожидаемся ОБОИХ консьюмеров ПЕРЕД тем, как run() в main.go закроет их
+	// Дожидаемся ВСЕХ консьюмеров ПЕРЕД тем, как run() в main.go закроет их
 	// (Consumers.Close вызывает kafkax.Consumer.Close, который требует, чтобы
 	// Run уже вернул управление — см. docs задания про AllowRebalance и
 	// pkg/kafkax/shutdown_test.go).
 	deadline := time.After(consumersJoinTimeout)
-	for _, done := range []<-chan error{viewsDone, purchasesDone} {
+	for _, done := range []<-chan error{viewsDone, purchasesDone, uploadsDone, thumbnailsDone} {
 		select {
 		case err := <-done:
 			if err != nil && runErr == nil {

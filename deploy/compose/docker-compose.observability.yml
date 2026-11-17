@@ -140,6 +140,10 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+      # ClickHouse-плагин качается при старте контейнера — локальному стенду
+      # нужен интернет; плагин не входит в образ grafana/grafana. Расплата
+      # за это — первый `make up-observability` медленнее на загрузку плагина.
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
     volumes:
       - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro

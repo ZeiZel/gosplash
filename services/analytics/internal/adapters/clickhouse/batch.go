@@ -133,7 +133,11 @@ func (w *Writer[T]) flush() {
 	}
 	rows := w.pending
 	waiters := w.waiters
-	w.pending = nil
+	// Свежий backing array, а не nil: старый всё ещё держится локальной rows,
+	// пока insert не вернётся, поэтому новым строкам нужна новая память.
+	// Но ёмкостью maxBatch, а не с нуля — иначе каждая пачка растёт
+	// реаллокациями на первых же Add после флаша.
+	w.pending = make([]T, 0, w.maxBatch)
 	w.waiters = nil
 	w.mu.Unlock()
 

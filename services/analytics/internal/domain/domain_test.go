@@ -1,7 +1,6 @@
 package domain_test
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -72,7 +71,7 @@ func TestValidateLimit(t *testing.T) {
 			err := domain.ValidateLimit(tc.limit)
 			if tc.wantErr {
 				require.Error(t, err)
-				assert.True(t, errors.Is(err, domain.ErrInvalidLimit))
+				assert.ErrorIs(t, err, domain.ErrInvalidLimit)
 				return
 			}
 			assert.NoError(t, err)

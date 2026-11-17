@@ -1,0 +1,124 @@
+{
+  "uid": "gosplash-analytics",
+  "title": "gosplash analytics",
+  "description": "Продуктовые метрики из ClickHouse: просмотры, покупки, воронка «загружено → превью готово» и её лаг. Обновление раз в минуту, а не раз в 10 секунд как у overview: агрегаты по дням не меняются быстрее, а quantileExact по джойну сырых таблиц гонять каждые 10 секунд незачем.",
+  "tags": ["gosplash"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Просмотры/день",
+      "description": "sum(views) по photo_views_daily — материализованная витрина, а не сырые события: тот же запрос, которым живёт TopPhotos. Прямоугольники, а не линии по одной точке в сутки, читаются лучше на дневной решётке.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 30, "lineWidth": 1, "drawStyle": "bars", "barAlignment": 1, "barWidthFactor": 0.8 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT day AS time, sum(views) AS views FROM photo_views_daily WHERE $__timeFilter(day) GROUP BY day ORDER BY day"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Покупки и выручка/день",
+      "description": "Покупок в штуках слева, выручка в валюте справа: у них разные порядки, и на одной оси одно из чисел превращалось бы в лесенку у нуля. Выручка делится на 100 — из центов в единицы валюты, как их читает человек.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 30, "lineWidth": 1, "drawStyle": "bars", "barAlignment": 1, "barWidthFactor": 0.8 } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "revenue" },
+            "properties": [
+              { "id": "unit", "value": "currencyRUB" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT toStartOfDay(ts) AS time, count() AS purchases, sum(price_cents) / 100.0 AS revenue FROM purchases WHERE $__timeFilter(ts) GROUP BY time ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Загрузки и превью/день",
+      "description": "Обе стороны воронки на одной сетке: отставание нижнего ряда от верхнего — это фото, загруженные, но без готовых превью. Два запроса, а не FULL OUTER JOIN по day: у витрин нет общего ключа «день обязательно есть в обеих», и джойн терял бы дни, когда событий одного типа не было вовсе.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 30, "lineWidth": 1, "drawStyle": "bars", "barAlignment": 1, "barWidthFactor": 0.8 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT day AS time, sum(uploads) AS uploads FROM uploads_daily WHERE $__timeFilter(day) GROUP BY day ORDER BY day"
+        },
+        {
+          "refId": "B",
+          "format": "time_series",
+          "rawSql": "SELECT day AS time, sum(thumbnails) AS thumbnails FROM thumbnails_daily WHERE $__timeFilter(day) GROUP BY day ORDER BY day"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Лаг генерации превью",
+      "description": "p50/p95 времени от media.photo.uploaded до media.photo.thumbnail-ready за выбранный период. Квантили, а не среднее: застрявшее фото — это хвост распределения, и среднее его прячет. ifNaN — пустой период даёт ноль, а не NaN: «пар не было» и «лаг нулевой» для дежурного разные вещи.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "decimals": 0 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT ifNaN(quantileExact(0.5)(latency_ms), 0) AS p50_ms, ifNaN(quantileExact(0.95)(latency_ms), 0) AS p95_ms FROM (SELECT dateDiff('millisecond', u.ts, t.ts) AS latency_ms FROM uploads AS u INNER JOIN thumbnails AS t ON u.photo_id = t.photo_id WHERE $__timeFilter(u.ts) AND t.ts >= u.ts)"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Топ-10 фото за 7 дней",
+      "description": "Тот же запрос, что TopPhotos(period=week, limit=10), только без джойна за author_id: таблице в Grafana нужен только id и число просмотров. Окно зафиксировано 7 днями, а не переменной периода дашборда: «топ за произвольные 3 часа» — вопрос без смысла при дневной витрине.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 8 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT photo_id, sum(views) AS views FROM photo_views_daily WHERE day >= today() - 7 GROUP BY photo_id ORDER BY views DESC LIMIT 10"
+        }
+      ]
+    }
+  ]
+}

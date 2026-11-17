@@ -318,6 +318,271 @@ func (x *PhotoStatsResponse) GetRevenueCents() int64 {
 	return 0
 }
 
+// Воронка «загружено → превью готово» и лаг генерации превью. Считается по
+// дневным витринам uploads_daily/thumbnails_daily — это тот же случай, что
+// TopPhotos с photo_views_daily: сырые таблицы читал бы целиком ради двух
+// чисел, которые витрина хранит уже посчитанными.
+type FunnelStatsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// day | week | month
+	Period        string `protobuf:"bytes,1,opt,name=period,proto3" json:"period,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FunnelStatsRequest) Reset() {
+	*x = FunnelStatsRequest{}
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FunnelStatsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FunnelStatsRequest) ProtoMessage() {}
+
+func (x *FunnelStatsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FunnelStatsRequest.ProtoReflect.Descriptor instead.
+func (*FunnelStatsRequest) Descriptor() ([]byte, []int) {
+	return file_gosplash_analytics_v1_analytics_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *FunnelStatsRequest) GetPeriod() string {
+	if x != nil {
+		return x.Period
+	}
+	return ""
+}
+
+type FunnelStatsResponse struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Uploads    int64                  `protobuf:"varint,1,opt,name=uploads,proto3" json:"uploads,omitempty"`
+	Thumbnails int64                  `protobuf:"varint,2,opt,name=thumbnails,proto3" json:"thumbnails,omitempty"`
+	// thumbnails/uploads*100. Меньше ста — не ошибка округления, а честный
+	// сигнал «часть фото застряла между загрузкой и готовыми превью».
+	ReadyPercent float64 `protobuf:"fixed64,3,opt,name=ready_percent,json=readyPercent,proto3" json:"ready_percent,omitempty"`
+	// Лаг между media.photo.uploaded и media.photo.thumbnail-ready. Квантили,
+	// а не среднее, — по той же причине, что и в Grafana-панели Duration:
+	// среднее прячет хвост, а именно хвост здесь и болит (фото без превью
+	// не показывается в каталоге).
+	LatencyP50Ms  int64 `protobuf:"varint,4,opt,name=latency_p50_ms,json=latencyP50Ms,proto3" json:"latency_p50_ms,omitempty"`
+	LatencyP95Ms  int64 `protobuf:"varint,5,opt,name=latency_p95_ms,json=latencyP95Ms,proto3" json:"latency_p95_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FunnelStatsResponse) Reset() {
+	*x = FunnelStatsResponse{}
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FunnelStatsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FunnelStatsResponse) ProtoMessage() {}
+
+func (x *FunnelStatsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FunnelStatsResponse.ProtoReflect.Descriptor instead.
+func (*FunnelStatsResponse) Descriptor() ([]byte, []int) {
+	return file_gosplash_analytics_v1_analytics_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *FunnelStatsResponse) GetUploads() int64 {
+	if x != nil {
+		return x.Uploads
+	}
+	return 0
+}
+
+func (x *FunnelStatsResponse) GetThumbnails() int64 {
+	if x != nil {
+		return x.Thumbnails
+	}
+	return 0
+}
+
+func (x *FunnelStatsResponse) GetReadyPercent() float64 {
+	if x != nil {
+		return x.ReadyPercent
+	}
+	return 0
+}
+
+func (x *FunnelStatsResponse) GetLatencyP50Ms() int64 {
+	if x != nil {
+		return x.LatencyP50Ms
+	}
+	return 0
+}
+
+func (x *FunnelStatsResponse) GetLatencyP95Ms() int64 {
+	if x != nil {
+		return x.LatencyP95Ms
+	}
+	return 0
+}
+
+// Сводка по одному автору за период: та же пара views/purchases, что и
+// PhotoStats, но срез не по фото, а по человеку. Отдельный метод, а не
+// параметр PhotoStats, потому что под ними разные таблицы и разный состав
+// ответа (здесь есть uploads, которых у фото-среза нет).
+type AuthorStatsRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	AuthorId int64                  `protobuf:"varint,1,opt,name=author_id,json=authorId,proto3" json:"author_id,omitempty"`
+	// day | week | month
+	Period        string `protobuf:"bytes,2,opt,name=period,proto3" json:"period,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AuthorStatsRequest) Reset() {
+	*x = AuthorStatsRequest{}
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuthorStatsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuthorStatsRequest) ProtoMessage() {}
+
+func (x *AuthorStatsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuthorStatsRequest.ProtoReflect.Descriptor instead.
+func (*AuthorStatsRequest) Descriptor() ([]byte, []int) {
+	return file_gosplash_analytics_v1_analytics_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *AuthorStatsRequest) GetAuthorId() int64 {
+	if x != nil {
+		return x.AuthorId
+	}
+	return 0
+}
+
+func (x *AuthorStatsRequest) GetPeriod() string {
+	if x != nil {
+		return x.Period
+	}
+	return ""
+}
+
+type AuthorStatsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Views int64                  `protobuf:"varint,1,opt,name=views,proto3" json:"views,omitempty"`
+	// Приближение по uniqCombined — та же причина, что в PhotoStatsResponse.
+	UniqueViewersApprox int64 `protobuf:"varint,2,opt,name=unique_viewers_approx,json=uniqueViewersApprox,proto3" json:"unique_viewers_approx,omitempty"`
+	Purchases           int64 `protobuf:"varint,3,opt,name=purchases,proto3" json:"purchases,omitempty"`
+	RevenueCents        int64 `protobuf:"varint,4,opt,name=revenue_cents,json=revenueCents,proto3" json:"revenue_cents,omitempty"`
+	Uploads             int64 `protobuf:"varint,5,opt,name=uploads,proto3" json:"uploads,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *AuthorStatsResponse) Reset() {
+	*x = AuthorStatsResponse{}
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AuthorStatsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AuthorStatsResponse) ProtoMessage() {}
+
+func (x *AuthorStatsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_gosplash_analytics_v1_analytics_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AuthorStatsResponse.ProtoReflect.Descriptor instead.
+func (*AuthorStatsResponse) Descriptor() ([]byte, []int) {
+	return file_gosplash_analytics_v1_analytics_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *AuthorStatsResponse) GetViews() int64 {
+	if x != nil {
+		return x.Views
+	}
+	return 0
+}
+
+func (x *AuthorStatsResponse) GetUniqueViewersApprox() int64 {
+	if x != nil {
+		return x.UniqueViewersApprox
+	}
+	return 0
+}
+
+func (x *AuthorStatsResponse) GetPurchases() int64 {
+	if x != nil {
+		return x.Purchases
+	}
+	return 0
+}
+
+func (x *AuthorStatsResponse) GetRevenueCents() int64 {
+	if x != nil {
+		return x.RevenueCents
+	}
+	return 0
+}
+
+func (x *AuthorStatsResponse) GetUploads() int64 {
+	if x != nil {
+		return x.Uploads
+	}
+	return 0
+}
+
 var File_gosplash_analytics_v1_analytics_proto protoreflect.FileDescriptor
 
 const file_gosplash_analytics_v1_analytics_proto_rawDesc = "" +
@@ -341,11 +606,32 @@ const file_gosplash_analytics_v1_analytics_proto_rawDesc = "" +
 	"\x05views\x18\x02 \x01(\x03R\x05views\x122\n" +
 	"\x15unique_viewers_approx\x18\x03 \x01(\x03R\x13uniqueViewersApprox\x12\x1c\n" +
 	"\tpurchases\x18\x04 \x01(\x03R\tpurchases\x12#\n" +
-	"\rrevenue_cents\x18\x05 \x01(\x03R\frevenueCents2\xd5\x01\n" +
+	"\rrevenue_cents\x18\x05 \x01(\x03R\frevenueCents\",\n" +
+	"\x12FunnelStatsRequest\x12\x16\n" +
+	"\x06period\x18\x01 \x01(\tR\x06period\"\xc0\x01\n" +
+	"\x13FunnelStatsResponse\x12\x18\n" +
+	"\auploads\x18\x01 \x01(\x03R\auploads\x12\x1e\n" +
+	"\n" +
+	"thumbnails\x18\x02 \x01(\x03R\n" +
+	"thumbnails\x12#\n" +
+	"\rready_percent\x18\x03 \x01(\x01R\freadyPercent\x12$\n" +
+	"\x0elatency_p50_ms\x18\x04 \x01(\x03R\flatencyP50Ms\x12$\n" +
+	"\x0elatency_p95_ms\x18\x05 \x01(\x03R\flatencyP95Ms\"I\n" +
+	"\x12AuthorStatsRequest\x12\x1b\n" +
+	"\tauthor_id\x18\x01 \x01(\x03R\bauthorId\x12\x16\n" +
+	"\x06period\x18\x02 \x01(\tR\x06period\"\xbc\x01\n" +
+	"\x13AuthorStatsResponse\x12\x14\n" +
+	"\x05views\x18\x01 \x01(\x03R\x05views\x122\n" +
+	"\x15unique_viewers_approx\x18\x02 \x01(\x03R\x13uniqueViewersApprox\x12\x1c\n" +
+	"\tpurchases\x18\x03 \x01(\x03R\tpurchases\x12#\n" +
+	"\rrevenue_cents\x18\x04 \x01(\x03R\frevenueCents\x12\x18\n" +
+	"\auploads\x18\x05 \x01(\x03R\auploads2\xa1\x03\n" +
 	"\x10AnalyticsService\x12^\n" +
 	"\tTopPhotos\x12'.gosplash.analytics.v1.TopPhotosRequest\x1a(.gosplash.analytics.v1.TopPhotosResponse\x12a\n" +
 	"\n" +
-	"PhotoStats\x12(.gosplash.analytics.v1.PhotoStatsRequest\x1a).gosplash.analytics.v1.PhotoStatsResponseB\xd4\x01\n" +
+	"PhotoStats\x12(.gosplash.analytics.v1.PhotoStatsRequest\x1a).gosplash.analytics.v1.PhotoStatsResponse\x12d\n" +
+	"\vFunnelStats\x12).gosplash.analytics.v1.FunnelStatsRequest\x1a*.gosplash.analytics.v1.FunnelStatsResponse\x12d\n" +
+	"\vAuthorStats\x12).gosplash.analytics.v1.AuthorStatsRequest\x1a*.gosplash.analytics.v1.AuthorStatsResponseB\xd4\x01\n" +
 	"\x19com.gosplash.analytics.v1B\x0eAnalyticsProtoP\x01Z1gosplash/gen/go/gosplash/analytics/v1;analyticsv1\xa2\x02\x03GAX\xaa\x02\x15Gosplash.Analytics.V1\xca\x02\x15Gosplash\\Analytics\\V1\xe2\x02!Gosplash\\Analytics\\V1\\GPBMetadata\xea\x02\x17Gosplash::Analytics::V1b\x06proto3"
 
 var (
@@ -360,22 +646,30 @@ func file_gosplash_analytics_v1_analytics_proto_rawDescGZIP() []byte {
 	return file_gosplash_analytics_v1_analytics_proto_rawDescData
 }
 
-var file_gosplash_analytics_v1_analytics_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_gosplash_analytics_v1_analytics_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_gosplash_analytics_v1_analytics_proto_goTypes = []any{
-	(*TopPhotosRequest)(nil),   // 0: gosplash.analytics.v1.TopPhotosRequest
-	(*TopPhotosResponse)(nil),  // 1: gosplash.analytics.v1.TopPhotosResponse
-	(*PhotoRank)(nil),          // 2: gosplash.analytics.v1.PhotoRank
-	(*PhotoStatsRequest)(nil),  // 3: gosplash.analytics.v1.PhotoStatsRequest
-	(*PhotoStatsResponse)(nil), // 4: gosplash.analytics.v1.PhotoStatsResponse
+	(*TopPhotosRequest)(nil),    // 0: gosplash.analytics.v1.TopPhotosRequest
+	(*TopPhotosResponse)(nil),   // 1: gosplash.analytics.v1.TopPhotosResponse
+	(*PhotoRank)(nil),           // 2: gosplash.analytics.v1.PhotoRank
+	(*PhotoStatsRequest)(nil),   // 3: gosplash.analytics.v1.PhotoStatsRequest
+	(*PhotoStatsResponse)(nil),  // 4: gosplash.analytics.v1.PhotoStatsResponse
+	(*FunnelStatsRequest)(nil),  // 5: gosplash.analytics.v1.FunnelStatsRequest
+	(*FunnelStatsResponse)(nil), // 6: gosplash.analytics.v1.FunnelStatsResponse
+	(*AuthorStatsRequest)(nil),  // 7: gosplash.analytics.v1.AuthorStatsRequest
+	(*AuthorStatsResponse)(nil), // 8: gosplash.analytics.v1.AuthorStatsResponse
 }
 var file_gosplash_analytics_v1_analytics_proto_depIdxs = []int32{
 	2, // 0: gosplash.analytics.v1.TopPhotosResponse.photos:type_name -> gosplash.analytics.v1.PhotoRank
 	0, // 1: gosplash.analytics.v1.AnalyticsService.TopPhotos:input_type -> gosplash.analytics.v1.TopPhotosRequest
 	3, // 2: gosplash.analytics.v1.AnalyticsService.PhotoStats:input_type -> gosplash.analytics.v1.PhotoStatsRequest
-	1, // 3: gosplash.analytics.v1.AnalyticsService.TopPhotos:output_type -> gosplash.analytics.v1.TopPhotosResponse
-	4, // 4: gosplash.analytics.v1.AnalyticsService.PhotoStats:output_type -> gosplash.analytics.v1.PhotoStatsResponse
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
+	5, // 3: gosplash.analytics.v1.AnalyticsService.FunnelStats:input_type -> gosplash.analytics.v1.FunnelStatsRequest
+	7, // 4: gosplash.analytics.v1.AnalyticsService.AuthorStats:input_type -> gosplash.analytics.v1.AuthorStatsRequest
+	1, // 5: gosplash.analytics.v1.AnalyticsService.TopPhotos:output_type -> gosplash.analytics.v1.TopPhotosResponse
+	4, // 6: gosplash.analytics.v1.AnalyticsService.PhotoStats:output_type -> gosplash.analytics.v1.PhotoStatsResponse
+	6, // 7: gosplash.analytics.v1.AnalyticsService.FunnelStats:output_type -> gosplash.analytics.v1.FunnelStatsResponse
+	8, // 8: gosplash.analytics.v1.AnalyticsService.AuthorStats:output_type -> gosplash.analytics.v1.AuthorStatsResponse
+	5, // [5:9] is the sub-list for method output_type
+	1, // [1:5] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
 	1, // [1:1] is the sub-list for extension extendee
 	0, // [0:1] is the sub-list for field type_name
@@ -392,7 +686,7 @@ func file_gosplash_analytics_v1_analytics_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_gosplash_analytics_v1_analytics_proto_rawDesc), len(file_gosplash_analytics_v1_analytics_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

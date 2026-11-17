@@ -3,7 +3,8 @@
 Агрегаты просмотров и покупок поверх ClickHouse. Фаза 4 (`docs/PLAN.md`).
 
 gRPC-контракт: `proto/gosplash/analytics/v1/analytics.proto` (заморожен) —
-`TopPhotos(period, limit)` и `PhotoStats(photo_id, period)`. Наружу отдаются
+`TopPhotos(period, limit)`, `PhotoStats(photo_id, period)`,
+`FunnelStats(period)` и `AuthorStats(author_id, period)`. Наружу отдаются
 только СВОДКИ — метода «покажи все просмотры фото» здесь нет намеренно,
 такой запрос означал бы, что ClickHouse используют как OLTP-хранилище.
 
@@ -187,6 +188,69 @@ FROM photo_views GROUP BY day, photo_id;
 полагается на то, что строка на `(photo_id, day)` уже единственна, — это
 не перестраховка, а прямое следствие того, как устроен движок.
 
+## Воронка загрузки: `uploads`, `thumbnails` и их витрины
+
+Вторая пара фактов сервиса — начало и конец пути фото через конвейер:
+
+- `uploads` ← `media.photo.uploaded` («автор загрузил фото»),
+- `thumbnails` ← `media.photo.thumbnail-ready` («превью готовы»).
+
+Оба топика слушают два дополнительных Go-консьюмера
+(`internal/adapters/kafka`) — по тем же причинам, что и просмотры с
+покупками (ADR 0016: Envelope с `Any` движок разобрать не может). Это
+единственные в проекте чужие топики, которые читает аналитика: остальной
+сервис читает ТОЛЬКО события, адресованные ему же, а здесь событие
+переиспользуется — media публикует `uploaded` для каталога, и аналитика
+подписывается на него же, не заставляя media публиковать что-то ещё.
+
+Отдельные таблицы фактов, а не колонка `uploaded_at` где-то: воронке важен
+МОМЕНТ каждого шага (лаг считается между двумя событиями), а «шаги» — это
+факты истории ровно того же рода, что просмотр или покупка. `ORDER BY
+(author_id, ts)` у `uploads` отличается от остальных таблиц намеренно:
+единственный точечный отчёт по ней (`AuthorStats`) фильтрует по автору,
+тогда как `FunnelStats` читает таблицу только через джойн и дневную
+витрину, и физический порядок ей безразличен.
+
+Дневные витрины `uploads_daily`/`thumbnails_daily` (+ MV
+`uploads_daily_mv`/`thumbnails_daily_mv`) устроены в точности как
+`photo_views_daily`: SummingMergeTree по `(day)`, явный `sum()` в запросах,
+счётчики для `FunnelStats` и Grafana считаются по granules витрин, а не
+сканом сырых таблиц.
+
+### Лаг генерации превью — и честная оговорка
+
+`FunnelStats` считает p50/p95 времени от загрузки до готовых превью так
+(см. `funnelLatencyQuery` в `repository.go`):
+
+```sql
+SELECT ifNaN(quantileExact(0.5)(latency_ms), 0),
+       ifNaN(quantileExact(0.95)(latency_ms), 0)
+FROM (
+    SELECT dateDiff('millisecond', u.ts, t.ts) AS latency_ms
+    FROM uploads AS u
+    INNER JOIN thumbnails AS t ON u.photo_id = t.photo_id
+    WHERE u.ts >= ? AND t.ts >= u.ts
+)
+```
+
+Оговорок здесь две, и обе важны:
+
+1. **INNER JOIN по `photo_id` достаточен**, потому что у фото ровно один
+   upload и один thumbnail-ready — джойн не размножает строки. Точный
+   инструмент ClickHouse для «следующее событие после» — ASOF JOIN, но
+   здесь пары фиксированы и он избыточен. Редкие дубли at-least-once
+   (повторная доставка после незакоммиченного offset'а, см. ADR 0016 и
+   комментарий `Writer[T].Add` в `batch.go`) создают лишние пары и слегка
+   сдвигают квантили — это цена доставки: перцентили и так приблизительные
+   по своей природе, и бороться за третий знак здесь не за чем.
+2. **`ifNaN`, а не `coalesce`**: `quantileExact` над пустым множеством
+   возвращает NaN, а не NULL — агрегат без строк «неопределён», а не
+   «нулевой». Ноль в ответе означает «за период не было ни одной готовой
+   пары» и является ожидаемым значением отчёта, а не ошибкой.
+
+Демо: `make demo-funnel` (счётчики, ready % и квантили на засеянных
+данных + готовая grpcurl-строка).
+
 ## `unique_viewers_approx` — почему в ClickHouse, а не в Redis HLL
 
 В проекте уже есть готовый HyperLogLog в Redis (`pkg/redisx/hll.go`,
@@ -296,6 +360,8 @@ days' GROUP BY photo_id ORDER BY count(*) DESC LIMIT 100` на миллиона�
 | `KAFKA_CONSUMER_GROUP_ANALYTICS` | префикс consumer group | `analytics` |
 | `ANALYTICS_CH_BATCH_SIZE` / `ANALYTICS_CH_FLUSH_INTERVAL` | батчинг просмотров | `5000` / `2s` |
 | `ANALYTICS_CH_PURCHASE_BATCH_SIZE` / `ANALYTICS_CH_PURCHASE_FLUSH_INTERVAL` | батчинг покупок (меньше — их на порядки реже) | `100` / `1s` |
+| `ANALYTICS_CH_UPLOAD_BATCH_SIZE` / `ANALYTICS_CH_UPLOAD_FLUSH_INTERVAL` | батчинг загрузок воронки (пределы как у покупок — события редкие) | `100` / `5s` |
+| `ANALYTICS_CH_THUMBNAIL_BATCH_SIZE` / `ANALYTICS_CH_THUMBNAIL_FLUSH_INTERVAL` | батчинг готовности превью (та же причина) | `100` / `5s` |
 
 Общее (`Kafka.Brokers`, `Observe`, `GRPC.DefaultTimeout`) — из
 `config.Load()` (`pkg/config`), как у всех сервисов монорепы.
@@ -314,7 +380,9 @@ days' GROUP BY photo_id ORDER BY count(*) DESC LIMIT 100` на миллиона�
   вставку+чтение сквозь настоящий движок, включая материализованное
   представление и намеренную демонстрацию дублирования строки при повторной
   доставке (см. ADR 0016).
-- `make analytics-seed`, `make demo-clickhouse`, `make ch-cli`, `make
+- `make analytics-seed`, `make demo-clickhouse`, `make demo-funnel`,
+  `make ch-cli`, `make
   ch-tables` — требуют поднятый `clickhouse` (`make up`, входит в
   `deploy/compose/docker-compose.yml`); `demo-clickhouse` дополнительно
-  требует `pg-catalog`.
+  требует `pg-catalog`; grpcurl-строка из `demo-funnel` — запущенного
+  analytics с `GRPC_REFLECTION_ENABLED=true`.

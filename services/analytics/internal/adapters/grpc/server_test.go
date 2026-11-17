@@ -19,6 +19,8 @@ import (
 type fakeReader struct {
 	topPhotos []domain.PhotoRank
 	stats     domain.PhotoStats
+	funnel    domain.FunnelStats
+	author    domain.AuthorStats
 }
 
 func (f *fakeReader) TopPhotos(context.Context, domain.Period, int32) ([]domain.PhotoRank, error) {
@@ -27,6 +29,14 @@ func (f *fakeReader) TopPhotos(context.Context, domain.Period, int32) ([]domain.
 
 func (f *fakeReader) PhotoStats(context.Context, string, domain.Period) (domain.PhotoStats, error) {
 	return f.stats, nil
+}
+
+func (f *fakeReader) FunnelStats(context.Context, domain.Period) (domain.FunnelStats, error) {
+	return f.funnel, nil
+}
+
+func (f *fakeReader) AuthorStats(context.Context, int64, domain.Period) (domain.AuthorStats, error) {
+	return f.author, nil
 }
 
 func TestServer_TopPhotos_NevernyPeriodDayotInvalidArgument(t *testing.T) {
@@ -94,4 +104,58 @@ func TestServer_PhotoStats_MappingVProtobuf(t *testing.T) {
 	assert.Equal(t, int64(42), resp.GetUniqueViewersApprox())
 	assert.Equal(t, int64(3), resp.GetPurchases())
 	assert.Equal(t, int64(4500), resp.GetRevenueCents())
+}
+
+func TestServer_FunnelStats_NevernyPeriodDayotInvalidArgument(t *testing.T) {
+	srv := analyticsgrpc.NewServer(app.NewStatsService(&fakeReader{}))
+
+	_, err := srv.FunnelStats(context.Background(), &analyticsv1.FunnelStatsRequest{Period: "century"})
+
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.InvalidArgument, st.Code())
+}
+
+func TestServer_FunnelStats_MappingVProtobuf(t *testing.T) {
+	reader := &fakeReader{funnel: domain.FunnelStats{
+		Uploads: 100, Thumbnails: 95, ReadyPercent: 95, LatencyP50Ms: 1500, LatencyP95Ms: 25000,
+	}}
+	srv := analyticsgrpc.NewServer(app.NewStatsService(reader))
+
+	resp, err := srv.FunnelStats(context.Background(), &analyticsv1.FunnelStatsRequest{Period: "week"})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), resp.GetUploads())
+	assert.Equal(t, int64(95), resp.GetThumbnails())
+	assert.InDelta(t, 95.0, resp.GetReadyPercent(), 1e-9)
+	assert.Equal(t, int64(1500), resp.GetLatencyP50Ms())
+	assert.Equal(t, int64(25000), resp.GetLatencyP95Ms())
+}
+
+func TestServer_AuthorStats_NepolozhitelnyIDDayotInvalidArgument(t *testing.T) {
+	srv := analyticsgrpc.NewServer(app.NewStatsService(&fakeReader{}))
+
+	_, err := srv.AuthorStats(context.Background(), &analyticsv1.AuthorStatsRequest{AuthorId: 0, Period: "day"})
+
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.InvalidArgument, st.Code())
+}
+
+func TestServer_AuthorStats_MappingVProtobuf(t *testing.T) {
+	reader := &fakeReader{author: domain.AuthorStats{
+		Views: 500, UniqueViewersApprox: 120, Purchases: 4, RevenueCents: 12500, Uploads: 9,
+	}}
+	srv := analyticsgrpc.NewServer(app.NewStatsService(reader))
+
+	resp, err := srv.AuthorStats(context.Background(), &analyticsv1.AuthorStatsRequest{AuthorId: 42, Period: "month"})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(500), resp.GetViews())
+	assert.Equal(t, int64(120), resp.GetUniqueViewersApprox())
+	assert.Equal(t, int64(4), resp.GetPurchases())
+	assert.Equal(t, int64(12500), resp.GetRevenueCents())
+	assert.Equal(t, int64(9), resp.GetUploads())
 }

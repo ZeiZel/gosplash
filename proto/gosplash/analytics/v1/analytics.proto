@@ -13,6 +13,8 @@ package gosplash.analytics.v1;
 service AnalyticsService {
   rpc TopPhotos(TopPhotosRequest) returns (TopPhotosResponse);
   rpc PhotoStats(PhotoStatsRequest) returns (PhotoStatsResponse);
+  rpc FunnelStats(FunnelStatsRequest) returns (FunnelStatsResponse);
+  rpc AuthorStats(AuthorStatsRequest) returns (AuthorStatsResponse);
 }
 
 message TopPhotosRequest {
@@ -47,4 +49,46 @@ message PhotoStatsResponse {
   int64 unique_viewers_approx = 3;
   int64 purchases = 4;
   int64 revenue_cents = 5;
+}
+
+// Воронка «загружено → превью готово» и лаг генерации превью. Считается по
+// дневным витринам uploads_daily/thumbnails_daily — это тот же случай, что
+// TopPhotos с photo_views_daily: сырые таблицы читал бы целиком ради двух
+// чисел, которые витрина хранит уже посчитанными.
+message FunnelStatsRequest {
+  // day | week | month
+  string period = 1;
+}
+
+message FunnelStatsResponse {
+  int64 uploads = 1;
+  int64 thumbnails = 2;
+  // thumbnails/uploads*100. Меньше ста — не ошибка округления, а честный
+  // сигнал «часть фото застряла между загрузкой и готовыми превью».
+  double ready_percent = 3;
+  // Лаг между media.photo.uploaded и media.photo.thumbnail-ready. Квантили,
+  // а не среднее, — по той же причине, что и в Grafana-панели Duration:
+  // среднее прячет хвост, а именно хвост здесь и болит (фото без превью
+  // не показывается в каталоге).
+  int64 latency_p50_ms = 4;
+  int64 latency_p95_ms = 5;
+}
+
+// Сводка по одному автору за период: та же пара views/purchases, что и
+// PhotoStats, но срез не по фото, а по человеку. Отдельный метод, а не
+// параметр PhotoStats, потому что под ними разные таблицы и разный состав
+// ответа (здесь есть uploads, которых у фото-среза нет).
+message AuthorStatsRequest {
+  int64 author_id = 1;
+  // day | week | month
+  string period = 2;
+}
+
+message AuthorStatsResponse {
+  int64 views = 1;
+  // Приближение по uniqCombined — та же причина, что в PhotoStatsResponse.
+  int64 unique_viewers_approx = 2;
+  int64 purchases = 3;
+  int64 revenue_cents = 4;
+  int64 uploads = 5;
 }

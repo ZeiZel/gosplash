@@ -24,19 +24,29 @@ func (fakeStatsReader) TopPhotos(context.Context, domain.Period, int32) ([]domai
 func (fakeStatsReader) PhotoStats(context.Context, string, domain.Period) (domain.PhotoStats, error) {
 	return domain.PhotoStats{}, nil
 }
+func (fakeStatsReader) FunnelStats(context.Context, domain.Period) (domain.FunnelStats, error) {
+	return domain.FunnelStats{}, nil
+}
+func (fakeStatsReader) AuthorStats(context.Context, int64, domain.Period) (domain.AuthorStats, error) {
+	return domain.AuthorStats{}, nil
+}
 
-// fakeConsumers — Consumers без Kafka: RunViews/RunPurchases блокируются до
-// отмены ctx, как настоящие kafkax.Consumer.Run, но не открывают ни одного
+// fakeConsumers — Consumers без Kafka: Run* блокируются до отмены ctx,
+// как настоящие kafkax.Consumer.Run, но не открывают ни одного
 // соединения — находка задания: analyticskafka.New не может собраться без
 // живой Kafka (см. её комментарий в internal/adapters/kafka/consumer.go),
 // поэтому Deps принимает интерфейс, а не *kafka.Consumers.
 type fakeConsumers struct{ closed bool }
 
-func (c *fakeConsumers) RunViews(ctx context.Context) error     { <-ctx.Done(); return nil }
-func (c *fakeConsumers) RunPurchases(ctx context.Context) error { <-ctx.Done(); return nil }
-func (c *fakeConsumers) PingViews(context.Context) error        { return nil }
-func (c *fakeConsumers) PingPurchases(context.Context) error    { return nil }
-func (c *fakeConsumers) Close()                                 { c.closed = true }
+func (c *fakeConsumers) RunViews(ctx context.Context) error      { <-ctx.Done(); return nil }
+func (c *fakeConsumers) RunPurchases(ctx context.Context) error  { <-ctx.Done(); return nil }
+func (c *fakeConsumers) RunUploads(ctx context.Context) error    { <-ctx.Done(); return nil }
+func (c *fakeConsumers) RunThumbnails(ctx context.Context) error { <-ctx.Done(); return nil }
+func (c *fakeConsumers) PingViews(context.Context) error         { return nil }
+func (c *fakeConsumers) PingPurchases(context.Context) error     { return nil }
+func (c *fakeConsumers) PingUploads(context.Context) error       { return nil }
+func (c *fakeConsumers) PingThumbnails(context.Context) error    { return nil }
+func (c *fakeConsumers) Close()                                  { c.closed = true }
 
 func validDeps() bootstrap.Deps {
 	return bootstrap.Deps{
